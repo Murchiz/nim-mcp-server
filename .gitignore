@@ -9,6 +9,10 @@ build/
 
 # ChromaDB data
 chroma_db/
+**/chroma_db/
+
+# Ruff cache
+.ruff_cache/
 
 # Environment
 .env

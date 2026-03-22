@@ -21,11 +21,11 @@ try:
     import tree_sitter_rust as tsrust
     import tree_sitter_typescript as tstypescript
     import tree_sitter_zig as tszig
-    from tree_sitter import Parser
+    from tree_sitter import Language, Parser
 except ImportError as e:
     raise ImportError(
         f"Missing tree-sitter dependencies. Please install: {e}\n"
-        "pip install tree-sitter==0.21.3 tree-sitter-python tree-sitter-javascript "
+        "pip install tree-sitter>=0.23 tree-sitter-python tree-sitter-javascript "
         "tree-sitter-typescript tree-sitter-java tree-sitter-c tree-sitter-cpp "
         "tree-sitter-c-sharp tree-sitter-rust tree-sitter-zig tree-sitter-go"
     )
@@ -134,11 +134,11 @@ def _get_language(extension: str) -> Optional[Any]:
 
     # Handle TypeScript special cases
     if extension == ".ts":
-        language = tstypescript.language_typescript()
+        language = Language(tstypescript.language_typescript())
     elif extension == ".tsx":
-        language = tstypescript.language_tsx()
+        language = Language(tstypescript.language_tsx())
     else:
-        language = lang_module.language()
+        language = Language(lang_module.language())
 
     _LANGUAGE_CACHE[extension] = language
     return language
@@ -154,9 +154,7 @@ def _get_parser(language: Any) -> Parser:
     Returns:
         Configured Parser instance
     """
-    parser = Parser()
-    parser.set_language(language)
-    return parser
+    return Parser(language)
 
 
 # =============================================================================

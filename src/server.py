@@ -501,6 +501,23 @@ def delete_document(document_id: str, collection: str = "default") -> Dict[str, 
 
 
 @mcp.tool()
+def delete_collection(collection_name: str) -> Dict[str, Any]:
+    """Delete a collection and all its documents.
+
+    Args:
+        collection_name: Name of the collection to delete
+
+    Returns:
+        Dict with deletion status
+    """
+    try:
+        chroma_client.delete_collection(name=collection_name)
+        return {"success": True, "collection_name": collection_name}
+    except Exception as e:
+        return {"success": False, "error": f"Failed to delete collection: {str(e)}"}
+
+
+@mcp.tool()
 def list_collections() -> Dict[str, Any]:
     """List all available collections.
 
@@ -972,70 +989,82 @@ def index_directory(
         failed_files = 0
         document_ids = []
 
-        # Read files and prepare batches
-        for i in range(0, len(code_files), batch_size):
-            batch_files = code_files[i : i + batch_size]
+        coll = get_or_create_collection(collection)
 
-            # Prepare batch for processing
-            codes = []
-            metadatas = []
+        # Read files and process
+        for file_path in code_files:
+            try:
+                # Read file content
+                file_content = normalize_file_content(file_path)
 
-            for file_path in batch_files:
-                try:
-                    # Read file content
-                    file_content = normalize_file_content(file_path)
+                # Create base metadata
+                base_metadata = {
+                    "filepath": os.path.abspath(file_path),
+                    "filename": os.path.basename(file_path),
+                    "language": detect_language_from_extension(file_path),
+                    "fileext": os.path.splitext(file_path)[1],
+                    "file_size": os.path.getsize(file_path),
+                    "indexed_at": datetime.now().isoformat(),
+                    "model": model,
+                    "method": "index_directory",
+                }
 
-                    # Create metadata
-                    metadata = {
-                        "filepath": os.path.abspath(file_path),
-                        "filename": os.path.basename(file_path),
-                        "language": detect_language_from_extension(file_path),
-                        "fileext": os.path.splitext(file_path)[1],
-                        "file_size": os.path.getsize(file_path),
-                        "indexed_at": datetime.now().isoformat(),
-                        "model": model,
-                        "method": "index_directory",
-                    }
+                # Check if we should use AST chunking
+                if (
+                    use_ast_chunking
+                    and ENABLE_AST_CHUNKING
+                    and is_extension_supported(file_path)
+                ):
+                    # Use AST-based chunking
+                    raw_chunks = chunk_code_by_ast(file_path, file_content)
+                    formatted_chunks = format_for_nvidia_nim(file_path, raw_chunks)
 
-                    codes.append(file_content)
-                    metadatas.append(metadata)
+                    # Index each chunk separately
+                    for i, chunk in enumerate(formatted_chunks):
+                        chunk_metadata = base_metadata.copy()
+                        chunk_metadata["chunk_index"] = i
+                        chunk_metadata["total_chunks"] = len(formatted_chunks)
+                        chunk_metadata["chunk_type"] = chunk["type"]
+                        chunk_metadata["chunk_start_line"] = chunk["start_line"]
+                        chunk_metadata["chunk_end_line"] = chunk["end_line"]
 
-                except Exception:
-                    failed_files += 1
-                    continue
-
-            # Batch index the codes
-            if codes:
-                try:
-                    coll = get_or_create_collection(collection)
-                    embeddings = []
-                    doc_ids = []
-
-                    # Generate embeddings
-                    for code in codes:
-                        embedding = get_embedding(
-                            code, model=model, input_type="passage"
+                        # Generate embedding for chunk
+                        chunk_embedding = get_embedding(
+                            chunk["text"], model=model, input_type="passage"
                         )
-                        embeddings.append(embedding)
+                        chunk_doc_id = generate_document_id(
+                            f"{file_path}:{chunk['type']}:{chunk['start_line']}"
+                        )
 
-                    # Generate document IDs
-                    for code in codes:
-                        doc_id = generate_document_id(code)
-                        doc_ids.append(doc_id)
+                        coll.upsert(
+                            ids=[chunk_doc_id],
+                            embeddings=[chunk_embedding],
+                            documents=[chunk["text"]],
+                            metadatas=[chunk_metadata],
+                        )
+                        document_ids.append(chunk_doc_id)
 
-                    # Batch insert into ChromaDB
+                    indexed_files += 1
+                else:
+                    # Simple indexing without AST chunking
+                    embedding = get_embedding(
+                        file_content, model=model, input_type="passage"
+                    )
+                    doc_id = generate_document_id(file_content)
+
                     coll.upsert(
-                        ids=doc_ids,
-                        embeddings=embeddings,
-                        documents=codes,
-                        metadatas=metadatas,
+                        ids=[doc_id],
+                        embeddings=[embedding],
+                        documents=[file_content],
+                        metadatas=[base_metadata],
                     )
 
-                    indexed_files += len(codes)
-                    document_ids.extend(doc_ids)
+                    indexed_files += 1
+                    document_ids.append(doc_id)
 
-                except Exception:
-                    failed_files += len(batch_files)
+            except Exception:
+                failed_files += 1
+                continue
 
         return {
             "success": True,
