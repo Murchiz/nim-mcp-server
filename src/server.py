@@ -37,7 +37,7 @@ NIM_RERANK_URL = "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking"
 
 # Default models
 DEFAULT_EMBED_MODEL = "nvidia/nv-embedcode-7b-v1"
-DEFAULT_RERANK_MODEL = "nv-rerank-qa-mistral-4b:1"
+DEFAULT_RERANK_MODEL = "nvidia/rerank-qa-mistral-4b"
 
 # ChromaDB settings
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
