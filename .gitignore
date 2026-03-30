@@ -15,6 +15,7 @@ chroma_db/
 .ruff_cache/
 
 # Environment
+.venv/
 .env
 *.env.local
 
