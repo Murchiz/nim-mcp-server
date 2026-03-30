@@ -259,6 +259,21 @@ def normalize_file_content(file_path: str) -> str:
     raise ValueError(f"Could not decode file {file_path} with any tried encoding")
 
 
+def _delete_entries_by_filepath(filepath: str, coll) -> int:
+    """Delete all indexed entries for a given filepath from a collection.
+
+    Args:
+        filepath: The file path to remove entries for
+        coll: The ChromaDB collection instance
+
+    Returns:
+        Number of entries deleted
+    """
+    abs_path = os.path.abspath(filepath)
+    result = coll.delete(where={"filepath": {"$eq": abs_path}})
+    return result.get("deleted", 0) if isinstance(result, dict) else 0
+
+
 # ============================================================================
 # MCP Tools
 # ============================================================================
@@ -289,6 +304,10 @@ def index_code(
     """
     try:
         coll = get_or_create_collection(collection)
+
+        # Delete any previous entries for this filepath before re-indexing
+        if metadata and metadata.get("filepath"):
+            _delete_entries_by_filepath(metadata["filepath"], coll)
 
         # Check if we should use AST chunking
         if use_ast_chunking and ENABLE_AST_CHUNKING:
@@ -795,6 +814,9 @@ def index_file_by_path(
         if use_content_as_document:
             coll = get_or_create_collection(collection)
 
+            # Delete any previous entries for this file before re-indexing
+            _delete_entries_by_filepath(filepath, coll)
+
             # Check if we should use AST chunking
             if (
                 use_ast_chunking
@@ -878,6 +900,10 @@ def index_file_by_path(
         else:
             # Only index metadata, not content
             coll = get_or_create_collection(collection)
+
+            # Delete any previous entries for this file before re-indexing
+            _delete_entries_by_filepath(filepath, coll)
+
             doc_id = generate_document_id(json.dumps(file_metadata, sort_keys=True))
 
             # Add empty document
@@ -970,6 +996,23 @@ def index_directory(
                 code_files.append(file_path)
 
         if not code_files:
+            # Still clean up orphaned entries for this directory
+            coll = get_or_create_collection(collection)
+            abs_dir_path = os.path.abspath(directory_path) + os.sep
+            existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
+            tracked_files_in_dir = {
+                m["filepath"]
+                for m in existing_metadatas
+                if m
+                and "filepath" in m
+                and isinstance(m["filepath"], str)
+                and m["filepath"].startswith(abs_dir_path)
+            }
+            removed_orphans = 0
+            for orphan in tracked_files_in_dir:
+                _delete_entries_by_filepath(orphan, coll)
+                removed_orphans += 1
+
             return {
                 "success": True,
                 "directory": os.path.abspath(directory_path),
@@ -978,6 +1021,7 @@ def index_directory(
                 "indexed_files": 0,
                 "skipped_files": 0,
                 "failed_files": 0,
+                "removed_orphans": removed_orphans,
                 "document_ids": [],
                 "message": "No files found to index",
             }
@@ -990,6 +1034,19 @@ def index_directory(
         document_ids = []
 
         coll = get_or_create_collection(collection)
+
+        # Get existing tracked filepaths in this directory for orphan cleanup
+        abs_dir_path = os.path.abspath(directory_path) + os.sep
+        existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
+        tracked_files_in_dir = {
+            m["filepath"]
+            for m in existing_metadatas
+            if m
+            and "filepath" in m
+            and isinstance(m["filepath"], str)
+            and m["filepath"].startswith(abs_dir_path)
+        }
+        successfully_indexed_filepaths: set[str] = set()
 
         # Read files and process
         for file_path in code_files:
@@ -1008,6 +1065,9 @@ def index_directory(
                     "model": model,
                     "method": "index_directory",
                 }
+
+                # Delete any previous entries for this file before re-indexing
+                _delete_entries_by_filepath(file_path, coll)
 
                 # Check if we should use AST chunking
                 if (
@@ -1045,6 +1105,7 @@ def index_directory(
                         document_ids.append(chunk_doc_id)
 
                     indexed_files += 1
+                    successfully_indexed_filepaths.add(os.path.abspath(file_path))
                 else:
                     # Simple indexing without AST chunking
                     embedding = get_embedding(
@@ -1061,10 +1122,18 @@ def index_directory(
 
                     indexed_files += 1
                     document_ids.append(doc_id)
+                    successfully_indexed_filepaths.add(os.path.abspath(file_path))
 
             except Exception:
                 failed_files += 1
                 continue
+
+        # Remove orphaned entries for files that no longer exist in this directory
+        orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
+        removed_orphans = 0
+        for orphan in orphaned_files:
+            _delete_entries_by_filepath(orphan, coll)
+            removed_orphans += 1
 
         return {
             "success": True,
@@ -1074,6 +1143,7 @@ def index_directory(
             "indexed_files": indexed_files,
             "skipped_files": skipped_files,
             "failed_files": failed_files,
+            "removed_orphans": removed_orphans,
             "document_ids": document_ids,
             "message": "Directory indexing completed",
         }

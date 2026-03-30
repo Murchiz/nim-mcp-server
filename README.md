@@ -18,7 +18,7 @@ An MCP server for semantic code search using NVIDIA NIM embeddings and reranking
 ## Setup
 
 ```bash
-pip install -r requirements.txt
+uv sync
 ```
 
 Set your API key:
@@ -36,12 +36,11 @@ export NVIDIA_API_KEY="your-api-key-here"
 {
   "mcpServers": {
     "nim-code-search": {
-      "command": "python",
-      "args": ["E:\\Tyt\\repos\\nim-mcp-server\\src\\server.py"],
+      "command": "uv",
+      "args": ["run", "src/server.py"],
       "env": {
         "NVIDIA_API_KEY": "your-api-key-here",
-        "CHROMA_PERSIST_DIR": "./chroma_db",
-        "PYTHONPATH": "E:\\Tyt\\repos\\nim-mcp-server"
+        "CHROMA_PERSIST_DIR": "./chroma_db"
       }
     }
   }
