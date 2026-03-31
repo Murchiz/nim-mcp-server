@@ -34,18 +34,19 @@ export NVIDIA_API_KEY="your-api-key-here"
 
 ```json
 {
-  "mcpServers": {
-    "nim-code-search": {
-      "command": "uv",
-      "args": ["run", "src/server.py"],
-      "env": {
-        "NVIDIA_API_KEY": "your-api-key-here",
-        "CHROMA_PERSIST_DIR": "./chroma_db"
-      }
-    }
-  }
+ "mcpServers": {
+   "nim-code-search": {
+     "command": "uv",
+     "args": ["run", "--directory", "/absolute/path/to/nim-mcp-server", "src/server.py"],
+     "env": {
+       "NVIDIA_API_KEY": "your-api-key-here"
+     }
+   }
+ }
 }
 ```
+
+> **Note**: The `CHROMA_PERSIST_DIR` defaults to `./chroma_db` (relative to the working directory). When you use this MCP server in a project, the database will be created in that project's folder, keeping each project's indexed code separate. If you want to specify a custom location, add it to the `env` section.
 
 ## Environment Variables
 
