@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 
 # Tree-sitter core import (required)
 try:
-    from tree_sitter import Parser
+    from tree_sitter import Language, Parser
 except ImportError as e:
     raise ImportError(
         f"Missing tree-sitter core. Please install: {e}\npip install tree-sitter>=0.23"
@@ -189,15 +189,17 @@ def _get_language(extension: str) -> Optional[Any]:
     # Check if the language module is available
     lang_module = AVAILABLE_PARSERS.get(extension)
     if lang_module is None:
-        return None
+            return None
 
     # Handle TypeScript special cases - use language capsule directly
     if extension == ".ts":
-        language = lang_module.language_typescript()
+        capsule = lang_module.language_typescript()
     elif extension == ".tsx":
-        language = lang_module.language_tsx()
+        capsule = lang_module.language_tsx()
     else:
-        language = lang_module.language()
+        capsule = lang_module.language()
+
+    language = Language(capsule)
 
     _LANGUAGE_CACHE[extension] = language
     return language
@@ -235,43 +237,52 @@ def _extract_node_text(source_code: str, node) -> str:
 
 
 def _traverse_and_extract(
-    source_code: str, node, target_types: List[str], chunks: List[Dict]
+    source_code: str,
+    node,
+    target_types: List[str],
+    chunks: List[Dict],
+    max_chars: int = 3500,
 ) -> None:
     """
     Recursively traverse the AST and extract nodes matching target types.
 
-    IMPORTANT: If a parent node is extracted, we do NOT traverse into its children
-    to avoid overlapping/duplicate chunks.
+    If a node matches a target type and its text length is within max_chars,
+    it is extracted and children are NOT traversed. If the node exceeds max_chars,
+    it is NOT extracted and traversal continues into its children to break it down.
 
     Args:
         source_code: The full source code as a string
         node: Current tree-sitter node
         target_types: List of AST node types to extract
         chunks: List to append extracted chunks to
+        max_chars: Maximum character length for a chunk before falling through to children
     """
     # Check if this node matches one of our target types
     if node.type in target_types:
-        # Extract this node
         text = _extract_node_text(source_code, node)
 
-        # Get line numbers (0-indexed)
-        start_line = node.start_point[0]
-        end_line = node.end_point[0]
+        # Only extract if it fits within the character limit
+        if len(text) <= max_chars:
+            # Get line numbers (0-indexed)
+            start_line = node.start_point[0]
+            end_line = node.end_point[0]
 
-        chunk = {
-            "text": text,
-            "type": node.type,
-            "start_line": start_line,
-            "end_line": end_line,
-        }
-        chunks.append(chunk)
+            chunk = {
+                "text": text,
+                "type": node.type,
+                "start_line": start_line,
+                "end_line": end_line,
+            }
+            chunks.append(chunk)
 
-        # Do NOT traverse children - we extracted the parent completely
-        return
+            # Do NOT traverse children - we extracted the parent completely
+            return
+
+        # If len(text) > max_chars, fall through to traverse children
 
     # Traverse children if we didn't extract this node
     for child in node.children:
-        _traverse_and_extract(source_code, child, target_types, chunks)
+        _traverse_and_extract(source_code, child, target_types, chunks, max_chars)
 
 
 def chunk_code_by_ast(file_path: str, source_code: str) -> List[Dict]:

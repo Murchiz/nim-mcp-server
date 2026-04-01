@@ -6,19 +6,21 @@ This MCP server provides code embedding and reranking capabilities using NVIDIA 
 It uses ChromaDB as the vector database for storing and retrieving embeddings.
 """
 
-import asyncio
-import hashlib
-import json
+# Ensure local imports work when running from any directory
 import os
 import sys
-import time
-from datetime import datetime
-from typing import Any, Dict, List, Optional
 
-# Ensure local imports work when running from any directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
+
+# Standard library imports
+import asyncio
+import hashlib
+import json
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
 # Third-party imports
 import chromadb
@@ -423,7 +425,7 @@ async def index_code(
 @mcp.tool()
 async def search_code(
     query: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
     limit: int = 10,
     model: str = DEFAULT_EMBED_MODEL,
@@ -540,7 +542,7 @@ async def search_code(
 
 def delete_document(
     document_id: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
 ) -> Dict[str, Any]:
     """Delete a document from the collection.
@@ -567,7 +569,7 @@ def delete_document(
 
 def delete_collection(
     collection_name: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
     """Delete a collection and all its documents.
 
@@ -587,7 +589,7 @@ def delete_collection(
 
 
 def list_collections(
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
     """List all available collections.
 
@@ -611,7 +613,7 @@ def list_collections(
 
 def create_collection(
     collection_name: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
     """Create a new collection.
 
@@ -630,7 +632,7 @@ def create_collection(
 
 
 def get_collection_stats(
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
 ) -> Dict[str, Any]:
     """Get collection statistics.
@@ -670,7 +672,7 @@ def get_collection_stats(
 # ============================================================================
 async def batch_index_codes(
     codes: List[str],
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     base_metadata: Optional[Dict[str, Any]] = None,
     collection: str = "default",
     model: str = DEFAULT_EMBED_MODEL,
@@ -734,7 +736,7 @@ async def batch_index_codes(
         return {"success": False, "error": f"Batch indexing failed: {str(e)}"}
 
 
-def health_check() -> Dict[str, Any]:
+async def health_check() -> Dict[str, Any]:
     """Check server health and API connectivity.
 
     Returns:
@@ -754,7 +756,7 @@ def health_check() -> Dict[str, Any]:
     if NVIDIA_API_KEY:
         test_text = "test"
         try:
-            get_embedding(test_text, input_type="query")
+            await get_embedding(test_text, input_type="query")
             status["api_connected"] = True
         except Exception:
             status["api_connected"] = False
@@ -826,7 +828,7 @@ def get_ast_chunking_info() -> Dict[str, Any]:
 
 async def index_file_by_path(
     filepath: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
     model: str = DEFAULT_EMBED_MODEL,
     use_content_as_document: bool = True,
@@ -1026,7 +1028,7 @@ async def index_file_by_path(
 
 async def index_directory(
     directory_path: str,
-    db_path: str,
+    db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
     model: str = DEFAULT_EMBED_MODEL,
     extensions: Optional[List[str]] = None,
