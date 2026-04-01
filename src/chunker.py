@@ -9,26 +9,103 @@ It extracts meaningful code blocks (functions, classes, etc.) for embedding.
 import os
 from typing import Any, Dict, List, Optional
 
-# Tree-sitter imports
+# Tree-sitter core import (required)
 try:
-    import tree_sitter_c as tsc
-    import tree_sitter_c_sharp as tscsharp
-    import tree_sitter_cpp as tscpp
-    import tree_sitter_go as tsgo
-    import tree_sitter_java as tsjava
-    import tree_sitter_javascript as tsjavascript
-    import tree_sitter_python as tspython
-    import tree_sitter_rust as tsrust
-    import tree_sitter_typescript as tstypescript
-    import tree_sitter_zig as tszig
     from tree_sitter import Parser
 except ImportError as e:
     raise ImportError(
-        f"Missing tree-sitter dependencies. Please install: {e}\n"
-        "pip install tree-sitter>=0.23 tree-sitter-python tree-sitter-javascript "
-        "tree-sitter-typescript tree-sitter-java tree-sitter-c tree-sitter-cpp "
-        "tree-sitter-c-sharp tree-sitter-rust tree-sitter-zig tree-sitter-go"
+        f"Missing tree-sitter core. Please install: {e}\npip install tree-sitter>=0.23"
     )
+
+# Tree-sitter language imports (optional - each imported individually)
+# Dictionary to track successfully imported parsers
+AVAILABLE_PARSERS: Dict[str, Any] = {}
+
+# Python
+try:
+    import tree_sitter_python as tspython
+
+    AVAILABLE_PARSERS[".py"] = tspython
+except ImportError:
+    pass
+
+# JavaScript (.js, .jsx)
+try:
+    import tree_sitter_javascript as tsjavascript
+
+    AVAILABLE_PARSERS[".js"] = tsjavascript
+    AVAILABLE_PARSERS[".jsx"] = tsjavascript
+except ImportError:
+    pass
+
+# TypeScript (.ts, .tsx)
+try:
+    import tree_sitter_typescript as tstypescript
+
+    AVAILABLE_PARSERS[".ts"] = tstypescript
+    AVAILABLE_PARSERS[".tsx"] = tstypescript
+except ImportError:
+    pass
+
+# Java
+try:
+    import tree_sitter_java as tsjava
+
+    AVAILABLE_PARSERS[".java"] = tsjava
+except ImportError:
+    pass
+
+# C (.c, .h)
+try:
+    import tree_sitter_c as tsc
+
+    AVAILABLE_PARSERS[".c"] = tsc
+    AVAILABLE_PARSERS[".h"] = tsc
+except ImportError:
+    pass
+
+# C++ (.cpp, .hpp, .cc, .cxx)
+try:
+    import tree_sitter_cpp as tscpp
+
+    AVAILABLE_PARSERS[".cpp"] = tscpp
+    AVAILABLE_PARSERS[".hpp"] = tscpp
+    AVAILABLE_PARSERS[".cc"] = tscpp
+    AVAILABLE_PARSERS[".cxx"] = tscpp
+except ImportError:
+    pass
+
+# C#
+try:
+    import tree_sitter_c_sharp as tscsharp
+
+    AVAILABLE_PARSERS[".cs"] = tscsharp
+except ImportError:
+    pass
+
+# Rust
+try:
+    import tree_sitter_rust as tsrust
+
+    AVAILABLE_PARSERS[".rs"] = tsrust
+except ImportError:
+    pass
+
+# Zig
+try:
+    import tree_sitter_zig as tszig
+
+    AVAILABLE_PARSERS[".zig"] = tszig
+except ImportError:
+    pass
+
+# Go
+try:
+    import tree_sitter_go as tsgo
+
+    AVAILABLE_PARSERS[".go"] = tsgo
+except ImportError:
+    pass
 
 # =============================================================================
 # AST Node Type Mapping (EXACT configuration as specified)
@@ -98,8 +175,7 @@ _LANGUAGE_CACHE: Dict[str, Any] = {}
 
 
 def _get_language(extension: str) -> Optional[Any]:
-    """
-    Get the tree-sitter Language object for a given file extension.
+    """Get the tree-sitter Language object for a given file extension.
 
     Args:
         extension: File extension (e.g., '.py', '.js')
@@ -110,33 +186,16 @@ def _get_language(extension: str) -> Optional[Any]:
     if extension in _LANGUAGE_CACHE:
         return _LANGUAGE_CACHE[extension]
 
-    language_map = {
-        ".py": tspython,
-        ".js": tsjavascript,
-        ".jsx": tsjavascript,
-        ".ts": tstypescript,
-        ".tsx": tstypescript,
-        ".java": tsjava,
-        ".c": tsc,
-        ".h": tsc,
-        ".cpp": tscpp,
-        ".hpp": tscpp,
-        ".cc": tscpp,
-        ".cxx": tscpp,
-        ".cs": tscsharp,
-        ".rs": tsrust,
-        ".zig": tszig,
-        ".go": tsgo,
-    }
-    lang_module = language_map.get(extension)
+    # Check if the language module is available
+    lang_module = AVAILABLE_PARSERS.get(extension)
     if lang_module is None:
         return None
 
     # Handle TypeScript special cases - use language capsule directly
     if extension == ".ts":
-        language = tstypescript.language_typescript()
+        language = lang_module.language_typescript()
     elif extension == ".tsx":
-        language = tstypescript.language_tsx()
+        language = lang_module.language_tsx()
     else:
         language = lang_module.language()
 

@@ -6,7 +6,6 @@ This MCP server provides code embedding and reranking capabilities using NVIDIA 
 It uses ChromaDB as the vector database for storing and retrieving embeddings.
 """
 
-
 import hashlib
 import json
 import os
@@ -48,7 +47,11 @@ def get_rerank_url(model: str) -> str:
     if model == "nvidia/rerank-qa-mistral-4b":
         return "https://ai.api.nvidia.com/v1/retrieval/nvidia/reranking"
     # Strip vendor prefix for URL path
-    model_slug = model.split("/")[-1].replace(".", "_") if "/" in model else model.replace(".", "_")
+    model_slug = (
+        model.split("/")[-1].replace(".", "_")
+        if "/" in model
+        else model.replace(".", "_")
+    )
     return f"https://ai.api.nvidia.com/v1/retrieval/nvidia/{model_slug}/reranking"
 
 
@@ -138,12 +141,6 @@ def get_chroma_client(db_path: str) -> Any:
     if path not in _chroma_clients:
         _chroma_clients[path] = chromadb.PersistentClient(path=path)
     return _chroma_clients[path]
-
-
-
-
-
-
 
 
 # ============================================================================
@@ -544,7 +541,6 @@ def search_code(
         return {"success": False, "error": f"Search failed: {str(e)}"}
 
 
-@mcp.tool()
 def delete_document(
     document_id: str,
     db_path: str,
@@ -561,9 +557,6 @@ def delete_document(
         Dict with deletion status
     """
     try:
-        
-        
-
         coll = get_or_create_collection(collection, db_path)
         coll.delete(ids=[document_id])
         return {
@@ -575,7 +568,6 @@ def delete_document(
         return {"success": False, "error": f"Failed to delete document: {str(e)}"}
 
 
-@mcp.tool()
 def delete_collection(
     collection_name: str,
     db_path: str,
@@ -597,7 +589,6 @@ def delete_collection(
         return {"success": False, "error": f"Failed to delete collection: {str(e)}"}
 
 
-@mcp.tool()
 def list_collections(
     db_path: str,
 ) -> Dict[str, Any]:
@@ -621,7 +612,6 @@ def list_collections(
         return {"success": False, "error": f"Failed to list collections: {str(e)}"}
 
 
-@mcp.tool()
 def create_collection(
     collection_name: str,
     db_path: str,
@@ -642,7 +632,6 @@ def create_collection(
         return {"success": False, "error": f"Failed to create collection: {str(e)}"}
 
 
-@mcp.tool()
 def get_collection_stats(
     db_path: str,
     collection: str = "default",
@@ -704,9 +693,6 @@ def batch_index_codes(
         Dict with batch indexing results
     """
     try:
-        
-        
-
         client = get_chroma_client(db_path)
         coll = client.get_or_create_collection(name=collection)
 
@@ -751,7 +737,6 @@ def batch_index_codes(
         return {"success": False, "error": f"Batch indexing failed: {str(e)}"}
 
 
-@mcp.tool()
 def health_check() -> Dict[str, Any]:
     """Check server health and API connectivity.
 
@@ -796,7 +781,6 @@ def health_check() -> Dict[str, Any]:
     return status
 
 
-@mcp.tool()
 def get_supported_languages() -> Dict[str, Any]:
     """Get list of supported programming languages and their file extensions.
 
@@ -819,7 +803,6 @@ def get_supported_languages() -> Dict[str, Any]:
         }
 
 
-@mcp.tool()
 def get_ast_chunking_info() -> Dict[str, Any]:
     """Get information about AST-based chunking support.
 
@@ -844,7 +827,6 @@ def get_ast_chunking_info() -> Dict[str, Any]:
         }
 
 
-@mcp.tool()
 def index_file_by_path(
     filepath: str,
     db_path: str,
@@ -895,9 +877,6 @@ def index_file_by_path(
                 raise TimeoutError(
                     f"Operation exceeded {timeout_seconds} seconds timeout"
                 )
-
-        
-        
 
         # Determine file content source
         if code_content is not None:
@@ -1062,7 +1041,6 @@ def index_file_by_path(
         return {"success": False, "error": f"Failed to index file: {error_details}"}
 
 
-@mcp.tool()
 def index_directory(
     directory_path: str,
     db_path: str,
@@ -1107,9 +1085,6 @@ def index_directory(
             raise TimeoutError(f"Operation exceeded {timeout_seconds} seconds timeout")
 
     try:
-        
-        
-
         # Validate directory
         if not os.path.exists(directory_path):
             return {"success": False, "error": "Directory not found"}
@@ -1333,6 +1308,42 @@ def main():
     print(f"Supported languages: {len(SUPPORTED_EXTENSIONS)}")
     print()
 
+    # Conditional tool registration based on SERVER_MODE
+    # Default (unset) is "search" mode with only search_code
+    SERVER_MODE = os.getenv("NIM_SERVER_MODE", "search").lower()
+    print(f"Server mode: {SERVER_MODE}")
+
+    if SERVER_MODE == "admin":
+        # Admin mode: register all management and admin tools
+        mcp.add_tool(delete_document)
+        mcp.add_tool(delete_collection)
+        mcp.add_tool(list_collections)
+        mcp.add_tool(create_collection)
+        mcp.add_tool(get_collection_stats)
+        mcp.add_tool(health_check)
+        mcp.add_tool(get_supported_languages)
+        mcp.add_tool(get_ast_chunking_info)
+        mcp.add_tool(index_file_by_path)
+        mcp.add_tool(index_directory)
+        print(
+            "Registered admin tools: delete_document, delete_collection, list_collections, create_collection, get_collection_stats, health_check, get_supported_languages, get_ast_chunking_info, index_file_by_path, index_directory, search_code"
+        )
+    elif SERVER_MODE == "manage":
+        # Manage mode: register only management tools
+        mcp.add_tool(index_file_by_path)
+        mcp.add_tool(index_directory)
+        print(
+            "Registered manage tools: index_file_by_path, index_directory, search_code"
+        )
+    elif SERVER_MODE == "search":
+        # Search mode (default): only search_code is available via @mcp.tool() decorator
+        print("Registered search tools: search_code")
+    else:
+        # Unknown mode: default to search mode
+        print(f"Unknown mode '{SERVER_MODE}', defaulting to search mode")
+        print("Registered search tools: search_code")
+
+    print()
     # Run the server
     mcp.run()
 
