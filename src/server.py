@@ -6,12 +6,14 @@ This MCP server provides code embedding and reranking capabilities using NVIDIA 
 It uses ChromaDB as the vector database for storing and retrieving embeddings.
 """
 
+import glob
 import hashlib
 import json
 import os
 import sys
+import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 # Ensure local imports work when running from any directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -50,6 +52,55 @@ CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
 
 # File indexing settings
 MAX_FILE_SIZE = 1024 * 1024  # 1MB
+
+# Project root marker files - used for auto-project detection
+PROJECT_ROOT_MARKERS = [
+    # Version control
+    ".git",
+    # Python
+    "pyproject.toml",
+    "setup.py",
+    "requirements.txt",
+    "Pipfile",
+    # JavaScript/Node
+    "package.json",
+    "yarn.lock",
+    "pnpm-workspace.yaml",
+    # Rust
+    "Cargo.toml",
+    "Cargo.lock",
+    # Go
+    "go.mod",
+    "go.sum",
+    # Java
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    # C/C++
+    "CMakeLists.txt",
+    "Makefile",
+    "configure.ac",
+    # Ruby
+    "Gemfile",
+    ".gemspec",
+    # PHP
+    "composer.json",
+    # .NET
+    "*.csproj",
+    "*.sln",
+    # Docker
+    "Dockerfile",
+    "docker-compose.yml",
+    # CI/CD configs
+    ".github",
+    ".gitlab-ci.yml",
+    # Documentation
+    "README.md",
+    "LICENSE",
+    # IDE configs
+    ".vscode",
+    ".idea",
+]
 
 # AST Chunking settings
 ENABLE_AST_CHUNKING = True  # Enable AST-based semantic chunking
@@ -115,24 +166,105 @@ SKIP_DIRS = {
 # Initialize MCP server
 mcp = FastMCP("nim-code-embed-rerank")
 
-# Initialize ChromaDB client
-chroma_client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+# ChromaDB client cache - one client per path
+# Type annotation uses ClientAPI from chromadb
+_chroma_clients: Dict[str, Any] = {}
+
+
+def get_chroma_client(db_path: Optional[str] = None) -> Any:
+    """Get or create a ChromaDB client for the specified path."""
+    path = db_path or CHROMA_PERSIST_DIR
+    if path not in _chroma_clients:
+        _chroma_clients[path] = chromadb.PersistentClient(path=path)
+    return _chroma_clients[path]
+
+
+def get_chroma_client_for_path(
+    file_or_dir_path: str, db_path: Optional[str] = None
+) -> Tuple[Any, str]:
+    """Get ChromaDB client and resolve the actual DB path to use."""
+    if db_path:
+        return get_chroma_client(db_path), db_path
+
+    # Try to find project root
+    project_root = find_project_root(file_or_dir_path)
+    if project_root:
+        auto_db_path = os.path.join(project_root, ".chroma_db")
+        return get_chroma_client(auto_db_path), auto_db_path
+
+    # Fallback to global
+    return get_chroma_client(CHROMA_PERSIST_DIR), CHROMA_PERSIST_DIR
+
+
+def find_project_root(start_path: str) -> Optional[str]:
+    """Find project root by walking up looking for marker files."""
+    current = os.path.abspath(start_path)
+    if os.path.isfile(current):
+        current = os.path.dirname(current)
+
+    # Save the initial file directory for fallback
+    initial_dir = current
+
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        for marker in PROJECT_ROOT_MARKERS:
+            marker_path = os.path.join(current, marker)
+            # Handle glob patterns like *.csproj
+            if "*" in marker:
+                import glob
+
+                matches = glob.glob(os.path.join(current, marker))
+                if matches:
+                    return current
+            elif os.path.exists(marker_path):
+                return current
+        current = os.path.dirname(current)
+
+    # No marker found
+    return None
+
+
+def resolve_db_and_collection(
+    file_or_dir_path: str, db_path: Optional[str] = None, collection: str = "default"
+) -> tuple[str, str, Optional[str]]:
+    """Resolve database path intelligently.
+
+    Returns:
+        (db_path, collection_name, project_root)
+    """
+    # Find project root
+    project_root = find_project_root(file_or_dir_path)
+
+    if db_path:
+        # Explicit db_path provided - use it with original collection name
+        return db_path, collection, project_root
+
+    # Auto-detect based on project root
+    if project_root:
+        auto_db_path = os.path.join(project_root, ".chroma_db")
+    else:
+        # Fallback: use global CHROMA_PERSIST_DIR
+        auto_db_path = CHROMA_PERSIST_DIR
+
+    return auto_db_path, collection, project_root
+
 
 # ============================================================================
 # Helper Functions
 # ============================================================================
 
 
-def get_or_create_collection(name: str):
+def get_or_create_collection(name: str, db_path: Optional[str] = None):
     """Get or create a ChromaDB collection by name.
 
     Args:
         name: Name of the collection
+        db_path: Path to ChromaDB database (uses project-local or global if None)
 
     Returns:
         ChromaDB Collection object
     """
-    return chroma_client.get_or_create_collection(name=name)
+    client = get_chroma_client(db_path)
+    return client.get_or_create_collection(name=name)
 
 
 def get_embedding(
@@ -285,7 +417,7 @@ def _delete_entries_by_filepath(filepath: str, coll) -> int:
 # ============================================================================
 
 
-@mcp.tool()
+# DEPRECATED: Use index_file_by_path instead with code_content parameter
 def index_code(
     code: str,
     metadata: Optional[Dict[str, Any]] = None,
@@ -403,8 +535,14 @@ def search_code(
     model: str = DEFAULT_EMBED_MODEL,
     rerank_model: str = DEFAULT_RERANK_MODEL,
     include_reranking: bool = True,
+    project_path: Optional[str] = None,
+    db_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Search for code snippets using semantic similarity.
+
+    This tool searches within the context of a project. If project_path is provided,
+    it will auto-detect the project root and search in the project-local database.
+    Each project has its own isolated database, so collection names don't conflict.
 
     Args:
         query: The search query
@@ -413,16 +551,35 @@ def search_code(
         model: Embedding model to use for search
         rerank_model: Reranking model to use
         include_reranking: Whether to include reranking (recommended)
+        project_path: Path to project directory or file for auto project detection.
+            The database will be looked up in the detected project root.
+        db_path: Custom path for ChromaDB database. If not provided, will auto-detect
+            project root and search in .chroma_db in the project directory.
 
     Returns:
         Dict with search results and metadata
     """
     try:
+        # Resolve database path and collection with project namespacing
+        if project_path:
+            resolved_db_path, resolved_collection, detected_root = (
+                resolve_db_and_collection(project_path, db_path, collection)
+            )
+        elif db_path:
+            resolved_db_path = db_path
+            resolved_collection = collection
+            detected_root = None
+        else:
+            # Use global defaults
+            resolved_db_path = CHROMA_PERSIST_DIR
+            resolved_collection = collection
+            detected_root = None
+
         # First, get embeddings for the query
         query_embedding = get_embedding(query, model=model, input_type="query")
 
         # Get collection and query ChromaDB
-        coll = get_or_create_collection(collection)
+        coll = get_or_create_collection(resolved_collection, resolved_db_path)
 
         # Query the collection
         results = coll.query(
@@ -497,7 +654,9 @@ def search_code(
         return {
             "success": True,
             "query": query,
-            "collection": collection,
+            "collection": resolved_collection,
+            "project_root": detected_root,
+            "db_path": resolved_db_path,
             "limit": limit,
             "count": len(combined_results[:limit]),
             "results": combined_results[:limit],
@@ -507,50 +666,88 @@ def search_code(
 
 
 @mcp.tool()
-def delete_document(document_id: str, collection: str = "default") -> Dict[str, Any]:
+def delete_document(
+    document_id: str,
+    collection: str = "default",
+    project_path: Optional[str] = None,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """Delete a document from the collection.
+
+    Provide project_path to target a project-local database, or db_path for
+    explicit database location. If neither provided, uses global database.
 
     Args:
         document_id: The ID of the document to delete
         collection: Name of the collection
+        project_path: Path to project for auto project detection
+        db_path: Custom path for ChromaDB database
 
     Returns:
         Dict with deletion status
     """
     try:
-        coll = get_or_create_collection(collection)
+        # Resolve database path with project awareness
+        if project_path:
+            resolved_db_path, resolved_collection, _ = resolve_db_and_collection(
+                project_path, db_path, collection
+            )
+        elif db_path:
+            resolved_db_path = db_path
+            resolved_collection = collection
+        else:
+            # Default to global
+            resolved_db_path = CHROMA_PERSIST_DIR
+            resolved_collection = collection
+
+        coll = get_or_create_collection(resolved_collection, resolved_db_path)
         coll.delete(ids=[document_id])
-        return {"success": True, "document_id": document_id, "collection": collection}
+        return {
+            "success": True,
+            "document_id": document_id,
+            "collection": resolved_collection,
+        }
     except Exception as e:
         return {"success": False, "error": f"Failed to delete document: {str(e)}"}
 
 
 @mcp.tool()
-def delete_collection(collection_name: str) -> Dict[str, Any]:
+def delete_collection(
+    collection_name: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """Delete a collection and all its documents.
 
     Args:
         collection_name: Name of the collection to delete
+        db_path: Custom path for ChromaDB database. If not provided, uses global.
 
     Returns:
         Dict with deletion status
     """
     try:
-        chroma_client.delete_collection(name=collection_name)
+        client = get_chroma_client(db_path)
+        client.delete_collection(name=collection_name)
         return {"success": True, "collection_name": collection_name}
     except Exception as e:
         return {"success": False, "error": f"Failed to delete collection: {str(e)}"}
 
 
 @mcp.tool()
-def list_collections() -> Dict[str, Any]:
+def list_collections(
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """List all available collections.
+
+    Args:
+        db_path: Custom path for ChromaDB database. If not provided, uses global.
 
     Returns:
         Dict with list of collection names
     """
     try:
-        collections = chroma_client.list_collections()
+        client = get_chroma_client(db_path)
+        collections = client.list_collections()
         return {
             "success": True,
             "collections": [coll.name for coll in collections],
@@ -561,34 +758,42 @@ def list_collections() -> Dict[str, Any]:
 
 
 @mcp.tool()
-def create_collection(collection_name: str) -> Dict[str, Any]:
+def create_collection(
+    collection_name: str,
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
     """Create a new collection.
 
     Args:
         collection_name: Name for the new collection
+        db_path: Custom path for ChromaDB database. If not provided, uses global.
 
     Returns:
         Dict with creation status
     """
     try:
-        get_or_create_collection(collection_name)
+        get_or_create_collection(collection_name, db_path)
         return {"success": True, "collection_name": collection_name}
     except Exception as e:
         return {"success": False, "error": f"Failed to create collection: {str(e)}"}
 
 
 @mcp.tool()
-def get_collection_stats(collection: str = "default") -> Dict[str, Any]:
-    """Get statistics for a collection.
+def get_collection_stats(
+    collection: str = "default",
+    db_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Get collection statistics.
 
     Args:
         collection: Name of the collection
-
+        db_path: Custom path for ChromaDB database. If not provided, will auto-detect
+            project root and use .chroma_db in the project directory.
     Returns:
         Dict with collection statistics
     """
     try:
-        coll = get_or_create_collection(collection)
+        coll = get_or_create_collection(collection, db_path)
         stats = {
             "collection_name": collection,
             "document_count": coll.count(),
@@ -609,26 +814,49 @@ def get_collection_stats(collection: str = "default") -> Dict[str, Any]:
         return {"success": False, "error": f"Failed to get collection stats: {str(e)}"}
 
 
-@mcp.tool()
+# ============================================================================
+# Deprecated Tools - These are kept as internal helpers but are DEPRECATED
+# Use index_file_by_path with code_content parameter instead
+# ============================================================================
 def batch_index_codes(
     codes: List[str],
     base_metadata: Optional[Dict[str, Any]] = None,
     collection: str = "default",
     model: str = DEFAULT_EMBED_MODEL,
+    db_path: Optional[str] = None,
+    project_path: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Index multiple code snippets in batch.
+    """DEPRECATED: Index multiple code snippets in batch.
+
+    Use index_file_by_path with code_content parameter instead.
 
     Args:
         codes: List of code snippets to index
         base_metadata: Optional base metadata to apply to all
         collection: Name of the collection to store in
         model: Embedding model to use
+        db_path: Custom path for ChromaDB database
+        project_path: Path to project for auto-detection
 
     Returns:
         Dict with batch indexing results
     """
     try:
-        coll = get_or_create_collection(collection)
+        # Resolve database path with project awareness
+        if project_path:
+            resolved_db_path, resolved_collection, _ = resolve_db_and_collection(
+                project_path, db_path, collection
+            )
+        elif db_path:
+            resolved_db_path = db_path
+            resolved_collection = collection
+        else:
+            resolved_db_path = CHROMA_PERSIST_DIR
+            resolved_collection = collection
+
+        client = get_chroma_client(resolved_db_path)
+        coll = client.get_or_create_collection(name=resolved_collection)
+
         embeddings = []
         doc_ids = []
         metadatas = []
@@ -639,11 +867,9 @@ def batch_index_codes(
             try:
                 embedding = get_embedding(code, model=model, input_type="passage")
                 doc_id = generate_document_id(code)
-
                 metadata = base_metadata.copy() if base_metadata else {}
                 metadata["indexed_at"] = datetime.now().isoformat()
                 metadata["model"] = model
-
                 embeddings.append(embedding)
                 doc_ids.append(doc_id)
                 metadatas.append(metadata)
@@ -666,6 +892,7 @@ def batch_index_codes(
             "successful": successful,
             "failed": failed,
             "document_ids": doc_ids,
+            "collection": resolved_collection,
         }
     except Exception as e:
         return {"success": False, "error": f"Batch indexing failed: {str(e)}"}
@@ -772,41 +999,79 @@ def index_file_by_path(
     use_content_as_document: bool = True,
     custom_metadata: Optional[Dict[str, Any]] = None,
     use_ast_chunking: bool = True,
+    code_content: Optional[str] = None,
+    db_path: Optional[str] = None,
+    timeout_seconds: int = 300,
 ) -> Dict[str, Any]:
     """Index a file by its path.
 
-    When use_ast_chunking is True and the file extension is supported,
-    the file will be split into semantic chunks (functions, classes, etc.)
-    using AST parsing before indexing.
+    PRIMARY USE: Index files from disk. Use 'filepath' to specify which file to index.
+    The file content will be read automatically from disk.
+
+    FALLBACK USE (code_content): Only use 'code_content' when you need to index code
+    that does NOT exist as a file on disk (e.g., generated code, clipboard content,
+    or code from an external source). When 'code_content' is provided, it is treated
+    as if it were the content of the file at 'filepath', but 'filepath' must still
+    be provided for metadata purposes.
+
+    When use_ast_chunking is True and the file extension is supported, the file will
+    be split into semantic chunks (functions, classes, etc.) using AST parsing before
+    indexing.
 
     Args:
-        filepath: Path to the file to index
+        filepath: Absolute path to the file to index (MUST BE PROVIDED - used for metadata)
         collection: Name of the collection to store in
         model: Embedding model to use
         use_content_as_document: Whether to use file content as document (True)
             or just store metadata (False)
         custom_metadata: Additional metadata to attach to the file
         use_ast_chunking: Whether to use AST-based semantic chunking (default: True)
+        code_content: FALLBACK ONLY - Provide code directly instead of reading from file.
+            Only use when the code does not exist on disk!
+        db_path: Custom path for ChromaDB database. If not provided, will auto-detect
+            project root and create/use .chroma_db in the project directory.
+        timeout_seconds: Maximum time allowed for the operation in seconds (default: 300)
 
     Returns:
         Dict with indexing status and metadata
     """
     try:
-        # Check if file exists
-        if not os.path.exists(filepath):
-            return {"success": False, "error": "File not found"}
+        start_time = time.time()
 
-        # Check if it's a file
-        if not os.path.isfile(filepath):
-            return {"success": False, "error": "Path is not a file"}
+        def check_timeout():
+            if time.time() - start_time > timeout_seconds:
+                raise TimeoutError(
+                    f"Operation exceeded {timeout_seconds} seconds timeout"
+                )
 
-        # Check if file is too large
-        file_size = os.path.getsize(filepath)
-        if file_size > MAX_FILE_SIZE:
-            return {"success": False, "error": "File too large"}
+        # Resolve database path
+        resolved_db_path, resolved_collection, project_root = resolve_db_and_collection(
+            filepath, db_path, collection
+        )
 
-        # Read file content
-        file_content = normalize_file_content(filepath)
+        # Determine file content source
+        if code_content is not None:
+            # FALLBACK: Use provided code content instead of reading file
+            file_content = code_content
+            file_size = len(code_content.encode("utf-8"))
+        else:
+            # PRIMARY: Read file from disk
+            # Check if file exists
+            if not os.path.exists(filepath):
+                return {"success": False, "error": "File not found"}
+
+            # Check if it's a file
+            if not os.path.isfile(filepath):
+                return {"success": False, "error": "Path is not a file"}
+
+            # Check if file is too large
+            file_size = os.path.getsize(filepath)
+            if file_size > MAX_FILE_SIZE:
+                return {"success": False, "error": "File too large"}
+
+            check_timeout()
+            # Read file content
+            file_content = normalize_file_content(filepath)
 
         # Extract metadata
         file_metadata = custom_metadata.copy() if custom_metadata else {}
@@ -818,12 +1083,14 @@ def index_file_by_path(
 
         # Handle file content vs metadata-only indexing
         if use_content_as_document:
-            coll = get_or_create_collection(collection)
+            coll = get_or_create_collection(resolved_collection, resolved_db_path)
 
             # Delete any previous entries for this file before re-indexing
+            check_timeout()
             _delete_entries_by_filepath(filepath, coll)
 
             # Check if we should use AST chunking
+            check_timeout()
             if (
                 use_ast_chunking
                 and ENABLE_AST_CHUNKING
@@ -836,6 +1103,7 @@ def index_file_by_path(
                 # Index each chunk separately
                 doc_ids = []
                 for i, chunk in enumerate(formatted_chunks):
+                    check_timeout()
                     chunk_metadata = file_metadata.copy()
                     chunk_metadata["chunk_index"] = i
                     chunk_metadata["total_chunks"] = len(formatted_chunks)
@@ -847,6 +1115,7 @@ def index_file_by_path(
                     chunk_metadata["method"] = "index_file_by_path_ast_chunk"
 
                     # Generate embedding for chunk
+                    check_timeout()
                     chunk_embedding = get_embedding(
                         chunk["text"], model=model, input_type="passage"
                     )
@@ -867,14 +1136,18 @@ def index_file_by_path(
                     "document_ids": doc_ids,
                     "filepath": os.path.abspath(filepath),
                     "language": file_metadata["language"],
-                    "collection": collection,
+                    "collection": resolved_collection,
+                    "project_root": project_root,
+                    "db_path": resolved_db_path,
                     "message": f"Successfully indexed {len(doc_ids)} semantic chunks",
                     "chunking_method": "ast",
                     "metadata": file_metadata,
+                    "elapsed_seconds": round(time.time() - start_time, 2),
                 }
 
             # Fallback to simple indexing (no chunking)
             document_to_index = file_content
+            check_timeout()
             embedding = get_embedding(
                 document_to_index, model=model, input_type="passage"
             )
@@ -898,14 +1171,17 @@ def index_file_by_path(
                 "document_id": doc_id,
                 "filepath": os.path.abspath(filepath),
                 "language": file_metadata["language"],
-                "collection": collection,
+                "collection": resolved_collection,
+                "project_root": project_root,
+                "db_path": resolved_db_path,
                 "message": "Successfully indexed file by path",
                 "chunking_method": "none",
                 "metadata": file_metadata,
+                "elapsed_seconds": round(time.time() - start_time, 2),
             }
         else:
             # Only index metadata, not content
-            coll = get_or_create_collection(collection)
+            coll = get_or_create_collection(resolved_collection, resolved_db_path)
 
             # Delete any previous entries for this file before re-indexing
             _delete_entries_by_filepath(filepath, coll)
@@ -925,9 +1201,12 @@ def index_file_by_path(
                 "document_id": doc_id,
                 "filepath": os.path.abspath(filepath),
                 "language": file_metadata["language"],
-                "collection": collection,
+                "collection": resolved_collection,
+                "project_root": project_root,
+                "db_path": resolved_db_path,
                 "method": "metadata_only",
                 "message": "Successfully indexed file metadata only",
+                "elapsed_seconds": round(time.time() - start_time, 2),
             }
     except Exception as e:
         import traceback
@@ -946,15 +1225,21 @@ def index_directory(
     max_file_size: int = MAX_FILE_SIZE,
     batch_size: int = 10,
     use_ast_chunking: bool = True,
+    db_path: Optional[str] = None,
+    timeout_seconds: int = 300,
 ) -> Dict[str, Any]:
     """Index an entire directory tree for code files.
 
-    When use_ast_chunking is True and files have supported extensions,
-    files will be split into semantic chunks (functions, classes, etc.)
-    using AST parsing before indexing.
+    The database will be automatically created in a .chroma_db folder within
+    the detected project root (based on marker files like .git, package.json, etc.).
+    Each project gets its own isolated database directory.
+
+    When use_ast_chunking is True and files have supported extensions, files will
+    be split into semantic chunks (functions, classes, etc.) using AST parsing before
+    indexing.
 
     Args:
-        directory_path: Path to the directory to index
+        directory_path: Absolute path to the directory to index
         collection: Name of the collection to store in
         model: Embedding model to use
         extensions: List of file extensions to include (None for all supported)
@@ -962,17 +1247,33 @@ def index_directory(
         max_file_size: Maximum file size in bytes to index
         batch_size: Batch size for efficient processing
         use_ast_chunking: Whether to use AST-based semantic chunking (default: True)
+        db_path: Custom path for ChromaDB database. If not provided, will auto-detect
+            project root and create/use .chroma_db in the project directory.
+        timeout_seconds: Maximum time allowed for the operation in seconds (default: 300)
 
     Returns:
         Dict with indexing statistics
     """
+    start_time = time.time()
+
+    def check_timeout():
+        if time.time() - start_time > timeout_seconds:
+            raise TimeoutError(f"Operation exceeded {timeout_seconds} seconds timeout")
+
     try:
+        # Resolve database path
+        resolved_db_path, resolved_collection, project_root = resolve_db_and_collection(
+            directory_path, db_path, collection
+        )
+
         # Validate directory
         if not os.path.exists(directory_path):
             return {"success": False, "error": "Directory not found"}
 
         if not os.path.isdir(directory_path):
             return {"success": False, "error": "Path is not a directory"}
+
+        check_timeout()
 
         # Set defaults
         if extensions is None:
@@ -1003,8 +1304,9 @@ def index_directory(
 
         if not code_files:
             # Still clean up orphaned entries for this directory
-            coll = get_or_create_collection(collection)
+            coll = get_or_create_collection(resolved_collection, resolved_db_path)
             abs_dir_path = os.path.abspath(directory_path) + os.sep
+            check_timeout()
             existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
             tracked_files_in_dir = {
                 m["filepath"]
@@ -1022,7 +1324,9 @@ def index_directory(
             return {
                 "success": True,
                 "directory": os.path.abspath(directory_path),
-                "collection": collection,
+                "collection": resolved_collection,
+                "project_root": project_root,
+                "db_path": resolved_db_path,
                 "total_files": 0,
                 "indexed_files": 0,
                 "skipped_files": 0,
@@ -1030,6 +1334,7 @@ def index_directory(
                 "removed_orphans": removed_orphans,
                 "document_ids": [],
                 "message": "No files found to index",
+                "elapsed_seconds": round(time.time() - start_time, 2),
             }
 
         # Process files in batches
@@ -1039,8 +1344,9 @@ def index_directory(
         failed_files = 0
         document_ids = []
 
-        coll = get_or_create_collection(collection)
+        coll = get_or_create_collection(resolved_collection, resolved_db_path)
 
+        check_timeout()
         # Get existing tracked filepaths in this directory for orphan cleanup
         abs_dir_path = os.path.abspath(directory_path) + os.sep
         existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
@@ -1057,7 +1363,9 @@ def index_directory(
         # Read files and process
         for file_path in code_files:
             try:
+                check_timeout()
                 # Read file content
+                check_timeout()
                 file_content = normalize_file_content(file_path)
 
                 # Create base metadata
@@ -1073,6 +1381,7 @@ def index_directory(
                 }
 
                 # Delete any previous entries for this file before re-indexing
+                check_timeout()
                 _delete_entries_by_filepath(file_path, coll)
 
                 # Check if we should use AST chunking
@@ -1095,6 +1404,7 @@ def index_directory(
                         chunk_metadata["chunk_end_line"] = chunk["end_line"]
 
                         # Generate embedding for chunk
+                        check_timeout()
                         chunk_embedding = get_embedding(
                             chunk["text"], model=model, input_type="passage"
                         )
@@ -1114,6 +1424,7 @@ def index_directory(
                     successfully_indexed_filepaths.add(os.path.abspath(file_path))
                 else:
                     # Simple indexing without AST chunking
+                    check_timeout()
                     embedding = get_embedding(
                         file_content, model=model, input_type="passage"
                     )
@@ -1138,13 +1449,16 @@ def index_directory(
         orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
         removed_orphans = 0
         for orphan in orphaned_files:
+            check_timeout()
             _delete_entries_by_filepath(orphan, coll)
             removed_orphans += 1
 
         return {
             "success": True,
             "directory": os.path.abspath(directory_path),
-            "collection": collection,
+            "collection": resolved_collection,
+            "project_root": project_root,
+            "db_path": resolved_db_path,
             "total_files": total_files,
             "indexed_files": indexed_files,
             "skipped_files": skipped_files,
@@ -1152,9 +1466,15 @@ def index_directory(
             "removed_orphans": removed_orphans,
             "document_ids": document_ids,
             "message": "Directory indexing completed",
+            "elapsed_seconds": round(time.time() - start_time, 2),
         }
     except Exception as e:
-        return {"success": False, "error": f"Failed to index directory: {str(e)}"}
+        elapsed = round(time.time() - start_time, 2) if "start_time" in dir() else None
+        return {
+            "success": False,
+            "error": f"Failed to index directory: {str(e)}",
+            "elapsed_seconds": elapsed,
+        }
 
 
 # ============================================================================
