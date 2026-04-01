@@ -760,8 +760,8 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "chromadb" },
+    { name = "httpx" },
     { name = "mcp", extra = ["cli"] },
-    { name = "requests" },
     { name = "tree-sitter" },
     { name = "tree-sitter-c" },
     { name = "tree-sitter-c-sharp" },
@@ -778,8 +778,8 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "chromadb", specifier = ">=0.4.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
-    { name = "requests", specifier = ">=2.31.0" },
     { name = "tree-sitter", specifier = "==0.21.3" },
     { name = "tree-sitter-c" },
     { name = "tree-sitter-c-sharp" },
