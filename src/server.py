@@ -6,6 +6,7 @@ This MCP server provides code embedding and reranking capabilities using NVIDIA 
 It uses ChromaDB as the vector database for storing and retrieving embeddings.
 """
 
+import asyncio
 import hashlib
 import json
 import os
@@ -21,7 +22,7 @@ if SCRIPT_DIR not in sys.path:
 
 # Third-party imports
 import chromadb
-import requests
+import httpx
 
 # MCP imports
 from mcp.server.fastmcp import FastMCP
@@ -40,6 +41,9 @@ from chunker import (
 
 NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY", "")
 NIM_EMBED_URL = "https://integrate.api.nvidia.com/v1/embeddings"
+
+# Rate limiting semaphore for concurrent API calls
+api_semaphore = asyncio.Semaphore(5)
 
 
 def get_rerank_url(model: str) -> str:
@@ -162,7 +166,7 @@ def get_or_create_collection(name: str, db_path: str):
     return client.get_or_create_collection(name=name)
 
 
-def get_embedding(
+async def get_embedding(
     text: str,
     model: str = DEFAULT_EMBED_MODEL,
     input_type: str = "passage",
@@ -170,26 +174,15 @@ def get_embedding(
 ) -> List[float]:
     """Get embedding vector from NVIDIA NIM API.
 
-
-
     Args:
-
         text: The text to embed
-
         model: The embedding model to use
-
         input_type: 'passage' for indexing, 'query' for searching
-
         truncate: How to handle long inputs
 
-
-
     Returns:
-
         List of floats representing the embedding vector
-
     """
-
     if not NVIDIA_API_KEY:
         raise ValueError("NVIDIA_API_KEY environment variable is required")
 
@@ -206,7 +199,9 @@ def get_embedding(
         "Content-Type": "application/json",
     }
 
-    response = requests.post(NIM_EMBED_URL, json=payload, headers=headers)
+    async with api_semaphore:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(NIM_EMBED_URL, json=payload, headers=headers)
 
     if response.status_code != 200:
         error_msg = (
@@ -222,7 +217,7 @@ def get_embedding(
     return result["data"][0]["embedding"]
 
 
-def rerank(
+async def rerank(
     query: str,
     documents: List[str],
     model: str = DEFAULT_RERANK_MODEL,
@@ -255,7 +250,9 @@ def rerank(
         "Content-Type": "application/json",
     }
     rerank_url = get_rerank_url(model)
-    response = requests.post(rerank_url, json=payload, headers=headers)
+    async with api_semaphore:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(rerank_url, json=payload, headers=headers)
     response.raise_for_status()
     return response.json().get("rankings", [])
 
@@ -314,7 +311,7 @@ def _delete_entries_by_filepath(filepath: str, coll) -> int:
 
 
 # DEPRECATED: Use index_file_by_path instead with code_content parameter
-def index_code(
+async def index_code(
     code: str,
     metadata: Optional[Dict[str, Any]] = None,
     collection: str = "default",
@@ -368,7 +365,7 @@ def index_code(
                     )
 
                     # Generate embedding for chunk
-                    chunk_embedding = get_embedding(
+                    chunk_embedding = await get_embedding(
                         chunk["text"], model=model, input_type="passage"
                     )
                     chunk_doc_id = generate_document_id(
@@ -393,7 +390,7 @@ def index_code(
                 }
 
         # Fallback to simple indexing (no chunking)
-        embedding = get_embedding(code, model=model, input_type="passage")
+        embedding = await get_embedding(code, model=model, input_type="passage")
         doc_id = generate_document_id(code)
 
         if metadata is None:
@@ -424,7 +421,7 @@ def index_code(
 
 
 @mcp.tool()
-def search_code(
+async def search_code(
     query: str,
     db_path: str,
     collection: str = "default",
@@ -453,7 +450,7 @@ def search_code(
         # Use the provided database path directly
 
         # First, get embeddings for the query
-        query_embedding = get_embedding(query, model=model, input_type="query")
+        query_embedding = await get_embedding(query, model=model, input_type="query")
 
         # Get collection and query ChromaDB
         coll = get_or_create_collection(collection, db_path)
@@ -505,7 +502,7 @@ def search_code(
         # Rerank if requested
         if include_reranking and combined_results:
             rerank_input = [r["code"] for r in combined_results]
-            rerank_results = rerank(
+            rerank_results = await rerank(
                 query=query,
                 documents=rerank_input,
                 model=rerank_model,
@@ -671,7 +668,7 @@ def get_collection_stats(
 # Deprecated Tools - These are kept as internal helpers but are DEPRECATED
 # Use index_file_by_path with code_content parameter instead
 # ============================================================================
-def batch_index_codes(
+async def batch_index_codes(
     codes: List[str],
     db_path: str,
     base_metadata: Optional[Dict[str, Any]] = None,
@@ -704,7 +701,7 @@ def batch_index_codes(
 
         for code in codes:
             try:
-                embedding = get_embedding(code, model=model, input_type="passage")
+                embedding = await get_embedding(code, model=model, input_type="passage")
                 doc_id = generate_document_id(code)
                 metadata = base_metadata.copy() if base_metadata else {}
                 metadata["indexed_at"] = datetime.now().isoformat()
@@ -827,7 +824,7 @@ def get_ast_chunking_info() -> Dict[str, Any]:
         }
 
 
-def index_file_by_path(
+async def index_file_by_path(
     filepath: str,
     db_path: str,
     collection: str = "default",
@@ -836,7 +833,6 @@ def index_file_by_path(
     custom_metadata: Optional[Dict[str, Any]] = None,
     use_ast_chunking: bool = True,
     code_content: Optional[str] = None,
-    timeout_seconds: int = 300,
 ) -> Dict[str, Any]:
     """Index a file by its path.
 
@@ -864,19 +860,12 @@ def index_file_by_path(
         code_content: FALLBACK ONLY - Provide code directly instead of reading from file.
             Only use when the code does not exist on disk!
         db_path: Path to ChromaDB database for the project.
-        timeout_seconds: Maximum time allowed for the operation in seconds (default: 300)
 
     Returns:
         Dict with indexing status and metadata
     """
     try:
         start_time = time.time()
-
-        def check_timeout():
-            if time.time() - start_time > timeout_seconds:
-                raise TimeoutError(
-                    f"Operation exceeded {timeout_seconds} seconds timeout"
-                )
 
         # Determine file content source
         if code_content is not None:
@@ -898,7 +887,6 @@ def index_file_by_path(
             if file_size > MAX_FILE_SIZE:
                 return {"success": False, "error": "File too large"}
 
-            check_timeout()
             # Read file content
             file_content = normalize_file_content(filepath)
 
@@ -915,11 +903,9 @@ def index_file_by_path(
             coll = get_or_create_collection(collection, db_path)
 
             # Delete any previous entries for this file before re-indexing
-            check_timeout()
             _delete_entries_by_filepath(filepath, coll)
 
             # Check if we should use AST chunking
-            check_timeout()
             if (
                 use_ast_chunking
                 and ENABLE_AST_CHUNKING
@@ -932,7 +918,6 @@ def index_file_by_path(
                 # Index each chunk separately
                 doc_ids = []
                 for i, chunk in enumerate(formatted_chunks):
-                    check_timeout()
                     chunk_metadata = file_metadata.copy()
                     chunk_metadata["chunk_index"] = i
                     chunk_metadata["total_chunks"] = len(formatted_chunks)
@@ -944,8 +929,7 @@ def index_file_by_path(
                     chunk_metadata["method"] = "index_file_by_path_ast_chunk"
 
                     # Generate embedding for chunk
-                    check_timeout()
-                    chunk_embedding = get_embedding(
+                    chunk_embedding = await get_embedding(
                         chunk["text"], model=model, input_type="passage"
                     )
                     chunk_doc_id = generate_document_id(
@@ -975,8 +959,7 @@ def index_file_by_path(
 
             # Fallback to simple indexing (no chunking)
             document_to_index = file_content
-            check_timeout()
-            embedding = get_embedding(
+            embedding = await get_embedding(
                 document_to_index, model=model, input_type="passage"
             )
             doc_id = generate_document_id(file_content)
@@ -1041,7 +1024,7 @@ def index_file_by_path(
         return {"success": False, "error": f"Failed to index file: {error_details}"}
 
 
-def index_directory(
+async def index_directory(
     directory_path: str,
     db_path: str,
     collection: str = "default",
@@ -1051,7 +1034,6 @@ def index_directory(
     max_file_size: int = MAX_FILE_SIZE,
     batch_size: int = 10,
     use_ast_chunking: bool = True,
-    timeout_seconds: int = 300,
 ) -> Dict[str, Any]:
     """Index an entire directory tree for code files.
 
@@ -1073,16 +1055,11 @@ def index_directory(
         batch_size: Batch size for efficient processing
         use_ast_chunking: Whether to use AST-based semantic chunking (default: True)
         db_path: Path to ChromaDB database for the project.
-        timeout_seconds: Maximum time allowed for the operation in seconds (default: 300)
 
     Returns:
         Dict with indexing statistics
     """
     start_time = time.time()
-
-    def check_timeout():
-        if time.time() - start_time > timeout_seconds:
-            raise TimeoutError(f"Operation exceeded {timeout_seconds} seconds timeout")
 
     try:
         # Validate directory
@@ -1091,8 +1068,6 @@ def index_directory(
 
         if not os.path.isdir(directory_path):
             return {"success": False, "error": "Path is not a directory"}
-
-        check_timeout()
 
         # Set defaults
         if extensions is None:
@@ -1125,7 +1100,6 @@ def index_directory(
             # Still clean up orphaned entries for this directory
             coll = get_or_create_collection(collection, db_path)
             abs_dir_path = os.path.abspath(directory_path) + os.sep
-            check_timeout()
             existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
             tracked_files_in_dir = {
                 m["filepath"]
@@ -1164,7 +1138,6 @@ def index_directory(
 
         coll = get_or_create_collection(collection, db_path)
 
-        check_timeout()
         # Get existing tracked filepaths in this directory for orphan cleanup
         abs_dir_path = os.path.abspath(directory_path) + os.sep
         existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
@@ -1181,9 +1154,7 @@ def index_directory(
         # Read files and process
         for file_path in code_files:
             try:
-                check_timeout()
                 # Read file content
-                check_timeout()
                 file_content = normalize_file_content(file_path)
 
                 # Create base metadata
@@ -1199,7 +1170,6 @@ def index_directory(
                 }
 
                 # Delete any previous entries for this file before re-indexing
-                check_timeout()
                 _delete_entries_by_filepath(file_path, coll)
 
                 # Check if we should use AST chunking
@@ -1222,8 +1192,7 @@ def index_directory(
                         chunk_metadata["chunk_end_line"] = chunk["end_line"]
 
                         # Generate embedding for chunk
-                        check_timeout()
-                        chunk_embedding = get_embedding(
+                        chunk_embedding = await get_embedding(
                             chunk["text"], model=model, input_type="passage"
                         )
                         chunk_doc_id = generate_document_id(
@@ -1242,8 +1211,7 @@ def index_directory(
                     successfully_indexed_filepaths.add(os.path.abspath(file_path))
                 else:
                     # Simple indexing without AST chunking
-                    check_timeout()
-                    embedding = get_embedding(
+                    embedding = await get_embedding(
                         file_content, model=model, input_type="passage"
                     )
                     doc_id = generate_document_id(file_content)
@@ -1267,7 +1235,6 @@ def index_directory(
         orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
         removed_orphans = 0
         for orphan in orphaned_files:
-            check_timeout()
             _delete_entries_by_filepath(orphan, coll)
             removed_orphans += 1
 
