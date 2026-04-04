@@ -189,7 +189,7 @@ def _get_language(extension: str) -> Optional[Any]:
     # Check if the language module is available
     lang_module = AVAILABLE_PARSERS.get(extension)
     if lang_module is None:
-            return None
+        return None
 
     # Handle TypeScript special cases - use language capsule directly
     if extension == ".ts":
@@ -249,6 +249,8 @@ def _traverse_and_extract(
     If a node matches a target type and its text length is within max_chars,
     it is extracted and children are NOT traversed. If the node exceeds max_chars,
     it is NOT extracted and traversal continues into its children to break it down.
+    Any leftover code between extracted children is captured as a "miscellaneous" chunk
+    to preserve class-level variables, comments, and other orphaned context.
 
     Args:
         source_code: The full source code as a string
@@ -279,10 +281,64 @@ def _traverse_and_extract(
             return
 
         # If len(text) > max_chars, fall through to traverse children
+        # and capture orphaned code between them below
 
-    # Traverse children if we didn't extract this node
+    # Track state before traversing children
+    parent_start = node.start_byte
+    parent_end = node.end_byte
+
+    # Track byte ranges of children that actually produced new chunks
+    extracted_child_ranges: List[tuple[int, int]] = []
+
+    # Traverse children
     for child in node.children:
+        chunks_before_child = len(chunks)
         _traverse_and_extract(source_code, child, target_types, chunks, max_chars)
+        # If this child (or its descendants) produced new chunks, track its range
+        if len(chunks) > chunks_before_child:
+            extracted_child_ranges.append((child.start_byte, child.end_byte))
+
+    # Only capture orphaned code if we actually extracted something from children
+    if extracted_child_ranges:
+        # Sort ranges by start byte
+        extracted_child_ranges.sort()
+
+        # Find gaps between extracted child ranges within the parent
+        orphaned_parts: List[str] = []
+        orphaned_start_byte: Optional[int] = None
+        current_pos = parent_start
+
+        for child_start, child_end in extracted_child_ranges:
+            if child_start > current_pos:
+                gap_text = source_code[current_pos:child_start]
+                if gap_text.strip():
+                    if orphaned_start_byte is None:
+                        orphaned_start_byte = current_pos
+                    orphaned_parts.append(gap_text)
+            current_pos = max(current_pos, child_end)
+
+        # Check for gap after last extracted child
+        if current_pos < parent_end:
+            gap_text = source_code[current_pos:parent_end]
+            if gap_text.strip():
+                if orphaned_start_byte is None:
+                    orphaned_start_byte = current_pos
+                orphaned_parts.append(gap_text)
+
+        # Create glue chunk if we found orphaned code
+        if orphaned_parts and orphaned_start_byte is not None:
+            orphaned_text = "\n".join(part for part in orphaned_parts if part.strip())
+            if orphaned_text.strip():
+                start_line = source_code[:orphaned_start_byte].count("\n")
+                end_line = source_code[:parent_end].count("\n")
+
+                glue_chunk = {
+                    "text": orphaned_text,
+                    "type": "miscellaneous",
+                    "start_line": start_line,
+                    "end_line": end_line,
+                }
+                chunks.append(glue_chunk)
 
 
 def chunk_code_by_ast(file_path: str, source_code: str) -> List[Dict]:

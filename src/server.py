@@ -26,6 +26,21 @@ from typing import Any, Dict, List, Optional
 import chromadb
 import httpx
 
+# Global HTTP client with connection pooling for improved async performance
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+async def _get_http_client() -> httpx.AsyncClient:
+    """Get or create the global HTTP client with connection pooling."""
+    global _http_client
+    if _http_client is None or _http_client.is_closed:
+        _http_client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=20),
+            timeout=30.0,
+        )
+    return _http_client
+
+
 # MCP imports
 from mcp.server.fastmcp import FastMCP
 
@@ -174,7 +189,7 @@ async def get_embedding(
     input_type: str = "passage",
     truncate: str = "NONE",
 ) -> List[float]:
-    """Get embedding vector from NVIDIA NIM API.
+    """Get embedding vector from NVIDIA NIM API for a single text.
 
     Args:
         text: The text to embed
@@ -185,11 +200,40 @@ async def get_embedding(
     Returns:
         List of floats representing the embedding vector
     """
+    embeddings = await get_embeddings_batch(
+        [text], model=model, input_type=input_type, truncate=truncate
+    )
+    return embeddings[0]
+
+
+async def get_embeddings_batch(
+    texts: List[str],
+    model: str = DEFAULT_EMBED_MODEL,
+    input_type: str = "passage",
+    truncate: str = "NONE",
+) -> List[List[float]]:
+    """Get embedding vectors from NVIDIA NIM API for a batch of texts.
+
+    NVIDIA NIM supports batch inputs, which is much more efficient than
+    making individual requests.
+
+    Args:
+        texts: List of texts to embed
+        model: The embedding model to use
+        input_type: 'passage' for indexing, 'query' for searching
+        truncate: How to handle long inputs
+
+    Returns:
+        List of embedding vectors (one per input text)
+    """
     if not NVIDIA_API_KEY:
         raise ValueError("NVIDIA_API_KEY environment variable is required")
 
+    if not texts:
+        return []
+
     payload = {
-        "input": text,
+        "input": texts,
         "model": model,
         "input_type": input_type,
         "encoding_format": "float",
@@ -201,9 +245,9 @@ async def get_embedding(
         "Content-Type": "application/json",
     }
 
+    client = await _get_http_client()
     async with api_semaphore:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(NIM_EMBED_URL, json=payload, headers=headers)
+        response = await client.post(NIM_EMBED_URL, json=payload, headers=headers)
 
     if response.status_code != 200:
         error_msg = (
@@ -216,7 +260,9 @@ async def get_embedding(
     if "data" not in result or not result["data"]:
         raise ValueError(f"Empty response from NVIDIA NIM API: {result}")
 
-    return result["data"][0]["embedding"]
+    # Sort by index to ensure order matches input
+    sorted_data = sorted(result["data"], key=lambda x: x["index"])
+    return [item["embedding"] for item in sorted_data]
 
 
 async def rerank(
@@ -252,16 +298,21 @@ async def rerank(
         "Content-Type": "application/json",
     }
     rerank_url = get_rerank_url(model)
+    client = await _get_http_client()
     async with api_semaphore:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(rerank_url, json=payload, headers=headers)
+        response = await client.post(rerank_url, json=payload, headers=headers)
     response.raise_for_status()
     return response.json().get("rankings", [])
 
 
-def generate_document_id(text: str) -> str:
-    """Generate a unique ID for a document based on its content."""
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+def generate_document_id(text: str, filepath: str = "") -> str:
+    """Generate a unique ID for a document based on its content and filepath.
+
+    Including the filepath prevents hash collisions when different files
+    contain identical code snippets (e.g., `def __init__(self): pass`).
+    """
+    content_to_hash = f"{filepath}::{text}" if filepath else text
+    return hashlib.sha256(content_to_hash.encode()).hexdigest()[:16]
 
 
 def detect_language_from_extension(file_path: str) -> str:
@@ -270,8 +321,10 @@ def detect_language_from_extension(file_path: str) -> str:
     return EXTENSION_TO_LANGUAGE.get(ext, "unknown")
 
 
-def normalize_file_content(file_path: str) -> str:
+async def normalize_file_content(file_path: str) -> str:
     """Read file content with proper encoding detection.
+
+    Wrapped in asyncio.to_thread to prevent blocking the event loop.
 
     Args:
         file_path: Path to the file to read
@@ -279,21 +332,27 @@ def normalize_file_content(file_path: str) -> str:
     Returns:
         Content of the file as a string
     """
-    encodings_to_try = ["utf-8", "latin-1", "cp1252", "utf-16", "ascii"]
 
-    for encoding in encodings_to_try:
-        try:
-            with open(file_path, "r", encoding=encoding, errors="replace") as f:
-                content = f.read()
-            return content
-        except UnicodeDecodeError:
-            continue
+    def _read_file():
+        encodings_to_try = ["utf-8", "latin-1", "cp1252", "utf-16", "ascii"]
 
-    raise ValueError(f"Could not decode file {file_path} with any tried encoding")
+        for encoding in encodings_to_try:
+            try:
+                with open(file_path, "r", encoding=encoding, errors="replace") as f:
+                    content = f.read()
+                return content
+            except UnicodeDecodeError:
+                continue
+
+        raise ValueError(f"Could not decode file {file_path} with any tried encoding")
+
+    return await asyncio.to_thread(_read_file)
 
 
-def _delete_entries_by_filepath(filepath: str, coll) -> int:
+async def _delete_entries_by_filepath(filepath: str, coll) -> int:
     """Delete all indexed entries for a given filepath from a collection.
+
+    Wrapped in asyncio.to_thread to prevent blocking the event loop.
 
     Args:
         filepath: The file path to remove entries for
@@ -303,8 +362,12 @@ def _delete_entries_by_filepath(filepath: str, coll) -> int:
         Number of entries deleted
     """
     abs_path = os.path.abspath(filepath)
-    result = coll.delete(where={"filepath": {"$eq": abs_path}})
-    return result.get("deleted", 0) if isinstance(result, dict) else 0
+
+    def _delete():
+        result = coll.delete(where={"filepath": {"$eq": abs_path}})
+        return result.get("deleted", 0) if isinstance(result, dict) else 0
+
+    return await asyncio.to_thread(_delete)
 
 
 # ============================================================================
@@ -338,9 +401,9 @@ async def index_code(
     try:
         coll = get_or_create_collection(collection, CHROMA_PERSIST_DIR)
 
-        # Delete any previous entries for this filepath before re-indexing
+        # Delete any previous entries for this filepath before re-indexing (threaded)
         if metadata and metadata.get("filepath"):
-            _delete_entries_by_filepath(metadata["filepath"], coll)
+            await _delete_entries_by_filepath(metadata["filepath"], coll)
 
         # Check if we should use AST chunking
         if use_ast_chunking and ENABLE_AST_CHUNKING:
@@ -351,36 +414,62 @@ async def index_code(
                 raw_chunks = chunk_code_by_ast(filepath, code)
                 formatted_chunks = format_for_nvidia_nim(filepath, raw_chunks)
 
-                # Index each chunk separately
+                # Process chunks in batches with concurrent embedding
+                BATCH_SIZE = 15
                 doc_ids = []
-                for i, chunk in enumerate(formatted_chunks):
-                    chunk_metadata = metadata.copy() if metadata else {}
-                    chunk_metadata["chunk_index"] = i
-                    chunk_metadata["total_chunks"] = len(formatted_chunks)
-                    chunk_metadata["chunk_type"] = chunk["type"]
-                    chunk_metadata["chunk_start_line"] = chunk["start_line"]
-                    chunk_metadata["chunk_end_line"] = chunk["end_line"]
-                    chunk_metadata["indexed_at"] = datetime.now().isoformat()
-                    chunk_metadata["model"] = model
-                    chunk_metadata["language"] = detect_language_from_extension(
-                        filepath
+                all_ids = []
+                all_embeddings = []
+                all_documents = []
+                all_metadatas = []
+
+                for batch_start in range(0, len(formatted_chunks), BATCH_SIZE):
+                    batch_chunks = formatted_chunks[
+                        batch_start : batch_start + BATCH_SIZE
+                    ]
+                    batch_texts = [chunk["text"] for chunk in batch_chunks]
+
+                    # Concurrent batch embedding
+                    batch_embeddings = await get_embeddings_batch(
+                        batch_texts, model=model, input_type="passage"
                     )
 
-                    # Generate embedding for chunk
-                    chunk_embedding = await get_embedding(
-                        chunk["text"], model=model, input_type="passage"
-                    )
-                    chunk_doc_id = generate_document_id(
-                        f"{filepath}:{chunk['type']}:{chunk['start_line']}"
-                    )
+                    for i, chunk in enumerate(batch_chunks):
+                        global_idx = batch_start + i
+                        chunk_metadata = metadata.copy() if metadata else {}
+                        chunk_metadata["chunk_index"] = global_idx
+                        chunk_metadata["total_chunks"] = len(formatted_chunks)
+                        chunk_metadata["chunk_type"] = chunk["type"]
+                        chunk_metadata["chunk_start_line"] = chunk["start_line"]
+                        chunk_metadata["chunk_end_line"] = chunk["end_line"]
+                        chunk_metadata["indexed_at"] = datetime.now().isoformat()
+                        chunk_metadata["model"] = model
+                        chunk_metadata["language"] = detect_language_from_extension(
+                            filepath
+                        )
 
-                    coll.upsert(
-                        ids=[chunk_doc_id],
-                        embeddings=[chunk_embedding],
-                        documents=[chunk["text"]],
-                        metadatas=[chunk_metadata],
-                    )
-                    doc_ids.append(chunk_doc_id)
+                        # FIX: Include filepath in document ID
+                        chunk_doc_id = generate_document_id(
+                            chunk["text"], filepath=filepath
+                        )
+
+                        all_ids.append(chunk_doc_id)
+                        all_embeddings.append(batch_embeddings[i])
+                        all_documents.append(chunk["text"])
+                        all_metadatas.append(chunk_metadata)
+                        doc_ids.append(chunk_doc_id)
+
+                # Single batched upsert to ChromaDB (threaded)
+                if all_ids:
+
+                    def _upsert():
+                        coll.upsert(
+                            ids=all_ids,
+                            embeddings=all_embeddings,
+                            documents=all_documents,
+                            metadatas=all_metadatas,
+                        )
+
+                    await asyncio.to_thread(_upsert)
 
                 return {
                     "success": True,
@@ -393,7 +482,9 @@ async def index_code(
 
         # Fallback to simple indexing (no chunking)
         embedding = await get_embedding(code, model=model, input_type="passage")
-        doc_id = generate_document_id(code)
+        # FIX: Include filepath in document ID if available
+        filepath = metadata.get("filepath", "") if metadata else ""
+        doc_id = generate_document_id(code, filepath=filepath)
 
         if metadata is None:
             metadata = {}
@@ -403,12 +494,16 @@ async def index_code(
             "language", detect_language_from_extension(metadata.get("filename", ""))
         )
 
-        coll.upsert(
-            ids=[doc_id],
-            embeddings=[embedding],
-            documents=[code],
-            metadatas=[metadata],
-        )
+        # Threaded upsert
+        def _upsert():
+            coll.upsert(
+                ids=[doc_id],
+                embeddings=[embedding],
+                documents=[code],
+                metadatas=[metadata],
+            )
+
+        await asyncio.to_thread(_upsert)
 
         return {
             "success": True,
@@ -454,15 +549,17 @@ async def search_code(
         # First, get embeddings for the query
         query_embedding = await get_embedding(query, model=model, input_type="query")
 
-        # Get collection and query ChromaDB
+        # Get collection and query ChromaDB (threaded to prevent blocking)
         coll = get_or_create_collection(collection, db_path)
 
-        # Query the collection
-        results = coll.query(
-            query_embeddings=[query_embedding],
-            n_results=max(5, limit * 2),  # Get more results to rerank
-            include=["documents", "metadatas", "distances"],
-        )
+        def _query_chroma():
+            return coll.query(
+                query_embeddings=[query_embedding],
+                n_results=max(5, limit * 2),  # Get more results to rerank
+                include=["documents", "metadatas", "distances"],
+            )
+
+        results = await asyncio.to_thread(_query_chroma)
 
         # Extract data from ChromaDB response with null safety
         docs_list = results.get("documents", [[]])
@@ -511,10 +608,11 @@ async def search_code(
                 top_n=limit,
             )
 
-            # Map rerank results back to original results
+            # Map rerank results back to original results using enumerate
+            # FIX: Previously used combined_results.index(result) which is O(N)
+            # and breaks when duplicate texts exist
             rank_map = {item["index"]: item["logit"] for item in rerank_results}
-            for result in combined_results:
-                idx = combined_results.index(result)
+            for idx, result in enumerate(combined_results):
                 result["rerank_score"] = rank_map.get(idx, 0.0)
 
             # Sort by rerank score
@@ -540,7 +638,7 @@ async def search_code(
         return {"success": False, "error": f"Search failed: {str(e)}"}
 
 
-def delete_document(
+async def delete_document(
     document_id: str,
     db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
@@ -557,7 +655,11 @@ def delete_document(
     """
     try:
         coll = get_or_create_collection(collection, db_path)
-        coll.delete(ids=[document_id])
+
+        def _delete():
+            coll.delete(ids=[document_id])
+
+        await asyncio.to_thread(_delete)
         return {
             "success": True,
             "document_id": document_id,
@@ -567,7 +669,7 @@ def delete_document(
         return {"success": False, "error": f"Failed to delete document: {str(e)}"}
 
 
-def delete_collection(
+async def delete_collection(
     collection_name: str,
     db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
@@ -582,13 +684,17 @@ def delete_collection(
     """
     try:
         client = get_chroma_client(db_path)
-        client.delete_collection(name=collection_name)
+
+        def _delete():
+            client.delete_collection(name=collection_name)
+
+        await asyncio.to_thread(_delete)
         return {"success": True, "collection_name": collection_name}
     except Exception as e:
         return {"success": False, "error": f"Failed to delete collection: {str(e)}"}
 
 
-def list_collections(
+async def list_collections(
     db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
     """List all available collections.
@@ -601,7 +707,11 @@ def list_collections(
     """
     try:
         client = get_chroma_client(db_path)
-        collections = client.list_collections()
+
+        def _list():
+            return client.list_collections()
+
+        collections = await asyncio.to_thread(_list)
         return {
             "success": True,
             "collections": [coll.name for coll in collections],
@@ -611,7 +721,7 @@ def list_collections(
         return {"success": False, "error": f"Failed to list collections: {str(e)}"}
 
 
-def create_collection(
+async def create_collection(
     collection_name: str,
     db_path: str = CHROMA_PERSIST_DIR,
 ) -> Dict[str, Any]:
@@ -631,7 +741,7 @@ def create_collection(
         return {"success": False, "error": f"Failed to create collection: {str(e)}"}
 
 
-def get_collection_stats(
+async def get_collection_stats(
     db_path: str = CHROMA_PERSIST_DIR,
     collection: str = "default",
 ) -> Dict[str, Any]:
@@ -646,21 +756,24 @@ def get_collection_stats(
     """
     try:
         coll = get_or_create_collection(collection, db_path)
-        stats = {
-            "collection_name": collection,
-            "document_count": coll.count(),
-        }
 
-        # Get sample documents
-        sample_results = coll.get(limit=5)
-        if sample_results["documents"]:
-            stats["sample_documents"] = [
-                {"document_id": doc_id, "content": (doc[:100] if doc else "")}
-                for doc_id, doc in zip(
-                    sample_results["ids"], sample_results["documents"]
-                )
-            ]
+        def _get_stats():
+            stats = {
+                "collection_name": collection,
+                "document_count": coll.count(),
+            }
+            # Get sample documents
+            sample_results = coll.get(limit=5)
+            if sample_results["documents"]:
+                stats["sample_documents"] = [
+                    {"document_id": doc_id, "content": (doc[:100] if doc else "")}
+                    for doc_id, doc in zip(
+                        sample_results["ids"], sample_results["documents"]
+                    )
+                ]
+            return stats
 
+        stats = await asyncio.to_thread(_get_stats)
         return {"success": True, **stats}
     except Exception as e:
         return {"success": False, "error": f"Failed to get collection stats: {str(e)}"}
@@ -701,28 +814,54 @@ async def batch_index_codes(
         successful = 0
         failed = 0
 
-        for code in codes:
-            try:
-                embedding = await get_embedding(code, model=model, input_type="passage")
-                doc_id = generate_document_id(code)
-                metadata = base_metadata.copy() if base_metadata else {}
-                metadata["indexed_at"] = datetime.now().isoformat()
-                metadata["model"] = model
-                embeddings.append(embedding)
-                doc_ids.append(doc_id)
-                metadatas.append(metadata)
-                successful += 1
-            except Exception:
-                failed += 1
-
-        # Batch insert into ChromaDB
-        if embeddings:
-            coll.upsert(
-                ids=doc_ids,
-                embeddings=embeddings,
-                documents=codes[:successful],
-                metadatas=metadatas,
+        # Use batch embedding API for efficiency
+        try:
+            batch_embeddings = await get_embeddings_batch(
+                codes, model=model, input_type="passage"
             )
+            for i, code in enumerate(codes):
+                try:
+                    embedding = batch_embeddings[i]
+                    doc_id = generate_document_id(code)
+                    metadata = base_metadata.copy() if base_metadata else {}
+                    metadata["indexed_at"] = datetime.now().isoformat()
+                    metadata["model"] = model
+                    embeddings.append(embedding)
+                    doc_ids.append(doc_id)
+                    metadatas.append(metadata)
+                    successful += 1
+                except Exception:
+                    failed += 1
+        except Exception:
+            # Fallback to individual embeddings if batch fails
+            for code in codes:
+                try:
+                    embedding = await get_embedding(
+                        code, model=model, input_type="passage"
+                    )
+                    doc_id = generate_document_id(code)
+                    metadata = base_metadata.copy() if base_metadata else {}
+                    metadata["indexed_at"] = datetime.now().isoformat()
+                    metadata["model"] = model
+                    embeddings.append(embedding)
+                    doc_ids.append(doc_id)
+                    metadatas.append(metadata)
+                    successful += 1
+                except Exception:
+                    failed += 1
+
+        # Batch insert into ChromaDB (threaded)
+        if embeddings:
+
+            def _upsert():
+                coll.upsert(
+                    ids=doc_ids,
+                    embeddings=embeddings,
+                    documents=codes[:successful],
+                    metadatas=metadatas,
+                )
+
+            await asyncio.to_thread(_upsert)
 
         return {
             "success": True,
@@ -763,10 +902,14 @@ async def health_check() -> Dict[str, Any]:
     else:
         status["api_connected"] = False
 
-    # Test ChromaDB connectivity
+    # Test ChromaDB connectivity (threaded)
     try:
         test_coll = get_or_create_collection("health_check", CHROMA_PERSIST_DIR)
-        test_coll.count()
+
+        def _count():
+            return test_coll.count()
+
+        await asyncio.to_thread(_count)
         status["chroma_connected"] = True
     except Exception:
         status["chroma_connected"] = False
@@ -889,8 +1032,8 @@ async def index_file_by_path(
             if file_size > MAX_FILE_SIZE:
                 return {"success": False, "error": "File too large"}
 
-            # Read file content
-            file_content = normalize_file_content(filepath)
+            # Read file content (threaded to prevent blocking)
+            file_content = await normalize_file_content(filepath)
 
         # Extract metadata
         file_metadata = custom_metadata.copy() if custom_metadata else {}
@@ -904,8 +1047,8 @@ async def index_file_by_path(
         if use_content_as_document:
             coll = get_or_create_collection(collection, db_path)
 
-            # Delete any previous entries for this file before re-indexing
-            _delete_entries_by_filepath(filepath, coll)
+            # Delete any previous entries for this file before re-indexing (threaded)
+            await _delete_entries_by_filepath(filepath, coll)
 
             # Check if we should use AST chunking
             if (
@@ -917,34 +1060,60 @@ async def index_file_by_path(
                 raw_chunks = chunk_code_by_ast(filepath, file_content)
                 formatted_chunks = format_for_nvidia_nim(filepath, raw_chunks)
 
-                # Index each chunk separately
+                # Process chunks in batches with concurrent embedding requests
+                BATCH_SIZE = 15
                 doc_ids = []
-                for i, chunk in enumerate(formatted_chunks):
-                    chunk_metadata = file_metadata.copy()
-                    chunk_metadata["chunk_index"] = i
-                    chunk_metadata["total_chunks"] = len(formatted_chunks)
-                    chunk_metadata["chunk_type"] = chunk["type"]
-                    chunk_metadata["chunk_start_line"] = chunk["start_line"]
-                    chunk_metadata["chunk_end_line"] = chunk["end_line"]
-                    chunk_metadata["indexed_at"] = datetime.now().isoformat()
-                    chunk_metadata["model"] = model
-                    chunk_metadata["method"] = "index_file_by_path_ast_chunk"
+                all_ids = []
+                all_embeddings = []
+                all_documents = []
+                all_metadatas = []
 
-                    # Generate embedding for chunk
-                    chunk_embedding = await get_embedding(
-                        chunk["text"], model=model, input_type="passage"
-                    )
-                    chunk_doc_id = generate_document_id(
-                        f"{filepath}:{chunk['type']}:{chunk['start_line']}"
+                for batch_start in range(0, len(formatted_chunks), BATCH_SIZE):
+                    batch_chunks = formatted_chunks[
+                        batch_start : batch_start + BATCH_SIZE
+                    ]
+                    batch_texts = [chunk["text"] for chunk in batch_chunks]
+
+                    # Concurrent batch embedding
+                    batch_embeddings = await get_embeddings_batch(
+                        batch_texts, model=model, input_type="passage"
                     )
 
-                    coll.upsert(
-                        ids=[chunk_doc_id],
-                        embeddings=[chunk_embedding],
-                        documents=[chunk["text"]],
-                        metadatas=[chunk_metadata],
-                    )
-                    doc_ids.append(chunk_doc_id)
+                    for i, chunk in enumerate(batch_chunks):
+                        global_idx = batch_start + i
+                        chunk_metadata = file_metadata.copy()
+                        chunk_metadata["chunk_index"] = global_idx
+                        chunk_metadata["total_chunks"] = len(formatted_chunks)
+                        chunk_metadata["chunk_type"] = chunk["type"]
+                        chunk_metadata["chunk_start_line"] = chunk["start_line"]
+                        chunk_metadata["chunk_end_line"] = chunk["end_line"]
+                        chunk_metadata["indexed_at"] = datetime.now().isoformat()
+                        chunk_metadata["model"] = model
+                        chunk_metadata["method"] = "index_file_by_path_ast_chunk"
+
+                        # FIX: Include filepath in document ID to prevent hash collisions
+                        chunk_doc_id = generate_document_id(
+                            chunk["text"], filepath=filepath
+                        )
+
+                        all_ids.append(chunk_doc_id)
+                        all_embeddings.append(batch_embeddings[i])
+                        all_documents.append(chunk["text"])
+                        all_metadatas.append(chunk_metadata)
+                        doc_ids.append(chunk_doc_id)
+
+                # Single batched upsert to ChromaDB (threaded)
+                if all_ids:
+
+                    def _upsert():
+                        coll.upsert(
+                            ids=all_ids,
+                            embeddings=all_embeddings,
+                            documents=all_documents,
+                            metadatas=all_metadatas,
+                        )
+
+                    await asyncio.to_thread(_upsert)
 
                 return {
                     "success": True,
@@ -964,7 +1133,8 @@ async def index_file_by_path(
             embedding = await get_embedding(
                 document_to_index, model=model, input_type="passage"
             )
-            doc_id = generate_document_id(file_content)
+            # FIX: Include filepath in document ID
+            doc_id = generate_document_id(file_content, filepath=filepath)
 
             # Add indexing metadata
             file_metadata["indexed_at"] = datetime.now().isoformat()
@@ -972,12 +1142,16 @@ async def index_file_by_path(
             file_metadata["method"] = "index_file_by_path"
             file_metadata["original_content_length"] = len(file_content)
 
-            coll.upsert(
-                ids=[doc_id],
-                embeddings=[embedding],
-                documents=[document_to_index],
-                metadatas=[file_metadata],
-            )
+            # Threaded upsert
+            def _upsert():
+                coll.upsert(
+                    ids=[doc_id],
+                    embeddings=[embedding],
+                    documents=[document_to_index],
+                    metadatas=[file_metadata],
+                )
+
+            await asyncio.to_thread(_upsert)
 
             return {
                 "success": True,
@@ -995,18 +1169,24 @@ async def index_file_by_path(
             # Only index metadata, not content
             coll = get_or_create_collection(collection, db_path)
 
-            # Delete any previous entries for this file before re-indexing
-            _delete_entries_by_filepath(filepath, coll)
+            # Delete any previous entries for this file before re-indexing (threaded)
+            await _delete_entries_by_filepath(filepath, coll)
 
-            doc_id = generate_document_id(json.dumps(file_metadata, sort_keys=True))
-
-            # Add empty document
-            coll.upsert(
-                ids=[doc_id],
-                embeddings=[],  # No embedding for metadata-only documents
-                documents=[""],  # Empty document
-                metadatas=[file_metadata],
+            # FIX: Include filepath in document ID
+            doc_id = generate_document_id(
+                json.dumps(file_metadata, sort_keys=True), filepath=filepath
             )
+
+            # Add empty document (threaded)
+            def _upsert():
+                coll.upsert(
+                    ids=[doc_id],
+                    embeddings=[],  # No embedding for metadata-only documents
+                    documents=[""],  # Empty document
+                    metadatas=[file_metadata],
+                )
+
+            await asyncio.to_thread(_upsert)
 
             return {
                 "success": True,
@@ -1077,7 +1257,8 @@ async def index_directory(
 
         if skip_dirs is None:
             skip_dirs = list(SKIP_DIRS)
-
+            
+        skipped_files = 0
         # Find all code files recursively
         code_files = []
         for root, dirs, files in os.walk(directory_path, topdown=True):
@@ -1090,10 +1271,12 @@ async def index_directory(
                 # Skip based on file extension (if provided)
                 _, ext = os.path.splitext(file)
                 if ext not in extensions:
+                    skipped_files += 1
                     continue
 
                 # Skip if file is too large
                 if os.path.getsize(file_path) > max_file_size:
+                    skipped_files += 1
                     continue
 
                 code_files.append(file_path)
@@ -1102,7 +1285,12 @@ async def index_directory(
             # Still clean up orphaned entries for this directory
             coll = get_or_create_collection(collection, db_path)
             abs_dir_path = os.path.abspath(directory_path) + os.sep
-            existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
+
+            def _get_metadatas():
+                return coll.get(include=["metadatas"])["metadatas"] or []
+
+            existing_metadatas = await asyncio.to_thread(_get_metadatas)
+
             tracked_files_in_dir = {
                 m["filepath"]
                 for m in existing_metadatas
@@ -1113,7 +1301,7 @@ async def index_directory(
             }
             removed_orphans = 0
             for orphan in tracked_files_in_dir:
-                _delete_entries_by_filepath(orphan, coll)
+                await _delete_entries_by_filepath(orphan, coll)
                 removed_orphans += 1
 
             return {
@@ -1134,15 +1322,19 @@ async def index_directory(
         # Process files in batches
         total_files = len(code_files)
         indexed_files = 0
-        skipped_files = 0
         failed_files = 0
         document_ids = []
 
         coll = get_or_create_collection(collection, db_path)
 
-        # Get existing tracked filepaths in this directory for orphan cleanup
+        # Get existing tracked filepaths in this directory for orphan cleanup (threaded)
         abs_dir_path = os.path.abspath(directory_path) + os.sep
-        existing_metadatas = coll.get(include=["metadatas"])["metadatas"] or []
+
+        def _get_metadatas():
+            return coll.get(include=["metadatas"])["metadatas"] or []
+
+        existing_metadatas = await asyncio.to_thread(_get_metadatas)
+
         tracked_files_in_dir = {
             m["filepath"]
             for m in existing_metadatas
@@ -1153,11 +1345,13 @@ async def index_directory(
         }
         successfully_indexed_filepaths: set[str] = set()
 
-        # Read files and process
-        for file_path in code_files:
+        # Helper to process a single file
+        async def _process_file(file_path: str):
+            nonlocal indexed_files, failed_files
+
             try:
-                # Read file content
-                file_content = normalize_file_content(file_path)
+                # Read file content (threaded)
+                file_content = await normalize_file_content(file_path)
 
                 # Create base metadata
                 base_metadata = {
@@ -1171,8 +1365,8 @@ async def index_directory(
                     "method": "index_directory",
                 }
 
-                # Delete any previous entries for this file before re-indexing
-                _delete_entries_by_filepath(file_path, coll)
+                # Delete any previous entries for this file before re-indexing (threaded)
+                await _delete_entries_by_filepath(file_path, coll)
 
                 # Check if we should use AST chunking
                 if (
@@ -1184,60 +1378,111 @@ async def index_directory(
                     raw_chunks = chunk_code_by_ast(file_path, file_content)
                     formatted_chunks = format_for_nvidia_nim(file_path, raw_chunks)
 
-                    # Index each chunk separately
-                    for i, chunk in enumerate(formatted_chunks):
-                        chunk_metadata = base_metadata.copy()
-                        chunk_metadata["chunk_index"] = i
-                        chunk_metadata["total_chunks"] = len(formatted_chunks)
-                        chunk_metadata["chunk_type"] = chunk["type"]
-                        chunk_metadata["chunk_start_line"] = chunk["start_line"]
-                        chunk_metadata["chunk_end_line"] = chunk["end_line"]
+                    # Process chunks in batches with concurrent embedding
+                    CHUNK_BATCH_SIZE = 15
+                    file_doc_ids = []
+                    all_ids = []
+                    all_embeddings = []
+                    all_documents = []
+                    all_metadatas = []
 
-                        # Generate embedding for chunk
-                        chunk_embedding = await get_embedding(
-                            chunk["text"], model=model, input_type="passage"
-                        )
-                        chunk_doc_id = generate_document_id(
-                            f"{file_path}:{chunk['type']}:{chunk['start_line']}"
+                    for batch_start in range(
+                        0, len(formatted_chunks), CHUNK_BATCH_SIZE
+                    ):
+                        batch_chunks = formatted_chunks[
+                            batch_start : batch_start + CHUNK_BATCH_SIZE
+                        ]
+                        batch_texts = [chunk["text"] for chunk in batch_chunks]
+
+                        # Concurrent batch embedding
+                        batch_embeddings = await get_embeddings_batch(
+                            batch_texts, model=model, input_type="passage"
                         )
 
-                        coll.upsert(
-                            ids=[chunk_doc_id],
-                            embeddings=[chunk_embedding],
-                            documents=[chunk["text"]],
-                            metadatas=[chunk_metadata],
-                        )
-                        document_ids.append(chunk_doc_id)
+                        for i, chunk in enumerate(batch_chunks):
+                            global_idx = batch_start + i
+                            chunk_metadata = base_metadata.copy()
+                            chunk_metadata["chunk_index"] = global_idx
+                            chunk_metadata["total_chunks"] = len(formatted_chunks)
+                            chunk_metadata["chunk_type"] = chunk["type"]
+                            chunk_metadata["chunk_start_line"] = chunk["start_line"]
+                            chunk_metadata["chunk_end_line"] = chunk["end_line"]
 
-                    indexed_files += 1
-                    successfully_indexed_filepaths.add(os.path.abspath(file_path))
+                            # FIX: Include filepath in document ID
+                            chunk_doc_id = generate_document_id(
+                                chunk["text"], filepath=file_path
+                            )
+
+                            all_ids.append(chunk_doc_id)
+                            all_embeddings.append(batch_embeddings[i])
+                            all_documents.append(chunk["text"])
+                            all_metadatas.append(chunk_metadata)
+                            file_doc_ids.append(chunk_doc_id)
+
+                    # Single batched upsert to ChromaDB (threaded)
+                    if all_ids:
+
+                        def _upsert():
+                            coll.upsert(
+                                ids=all_ids,
+                                embeddings=all_embeddings,
+                                documents=all_documents,
+                                metadatas=all_metadatas,
+                            )
+
+                        await asyncio.to_thread(_upsert)
+
+                    return file_doc_ids
                 else:
                     # Simple indexing without AST chunking
                     embedding = await get_embedding(
                         file_content, model=model, input_type="passage"
                     )
-                    doc_id = generate_document_id(file_content)
+                    # FIX: Include filepath in document ID
+                    doc_id = generate_document_id(file_content, filepath=file_path)
 
-                    coll.upsert(
-                        ids=[doc_id],
-                        embeddings=[embedding],
-                        documents=[file_content],
-                        metadatas=[base_metadata],
-                    )
+                    # Threaded upsert
+                    def _upsert():
+                        coll.upsert(
+                            ids=[doc_id],
+                            embeddings=[embedding],
+                            documents=[file_content],
+                            metadatas=[base_metadata],
+                        )
 
-                    indexed_files += 1
-                    document_ids.append(doc_id)
-                    successfully_indexed_filepaths.add(os.path.abspath(file_path))
+                    await asyncio.to_thread(_upsert)
+
+                    return [doc_id]
 
             except Exception:
                 failed_files += 1
-                continue
+                return []
 
-        # Remove orphaned entries for files that no longer exist in this directory
+        # Process files concurrently in batches bounded by semaphore
+        FILE_BATCH_SIZE = 5
+        for batch_start in range(0, len(code_files), FILE_BATCH_SIZE):
+            batch_files = code_files[batch_start : batch_start + FILE_BATCH_SIZE]
+
+            # Create tasks for concurrent processing
+            tasks = [_process_file(fp) for fp in batch_files]
+            batch_results = await asyncio.gather(*tasks)
+
+            for i, file_doc_ids in enumerate(batch_results):
+                if file_doc_ids:
+                    indexed_files += 1
+                    document_ids.extend(file_doc_ids)
+                    # Track successfully indexed filepaths using enumerate index
+                    file_idx = batch_start + i
+                    if file_idx < len(code_files):
+                        successfully_indexed_filepaths.add(
+                            os.path.abspath(code_files[file_idx])
+                        )
+
+        # Remove orphaned entries for files that no longer exist in this directory (threaded)
         orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
         removed_orphans = 0
         for orphan in orphaned_files:
-            _delete_entries_by_filepath(orphan, coll)
+            await _delete_entries_by_filepath(orphan, coll)
             removed_orphans += 1
 
         return {
@@ -1268,8 +1513,17 @@ async def index_directory(
 # ============================================================================
 
 
+async def _cleanup_http_client():
+    """Cleanup the global HTTP client on shutdown."""
+    global _http_client
+    if _http_client and not _http_client.is_closed:
+        await _http_client.aclose()
+        _http_client = None
+
+
 def main():
     """Run the MCP server."""
+
     print("Starting NVIDIA NIM MCP Server...")
     print(f"ChromaDB path: {CHROMA_PERSIST_DIR}")
     print(f"Embed model: {DEFAULT_EMBED_MODEL}")
