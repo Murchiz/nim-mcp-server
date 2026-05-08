@@ -447,7 +447,7 @@ async def index_code(
                             filepath
                         )
 
-                        # FIX: Include filepath in document ID
+                        # Include filepath in document ID
                         chunk_doc_id = generate_document_id(
                             chunk["text"], filepath=filepath
                         )
@@ -482,7 +482,7 @@ async def index_code(
 
         # Fallback to simple indexing (no chunking)
         embedding = await get_embedding(code, model=model, input_type="passage")
-        # FIX: Include filepath in document ID if available
+        # Include filepath in document ID if available
         filepath = metadata.get("filepath", "") if metadata else ""
         doc_id = generate_document_id(code, filepath=filepath)
 
@@ -609,7 +609,7 @@ async def search_code(
             )
 
             # Map rerank results back to original results using enumerate
-            # FIX: Previously used combined_results.index(result) which is O(N)
+            # Previously used combined_results.index(result) which is O(N)
             # and breaks when duplicate texts exist
             rank_map = {item["index"]: item["logit"] for item in rerank_results}
             for idx, result in enumerate(combined_results):
@@ -1091,7 +1091,7 @@ async def index_file_by_path(
                         chunk_metadata["model"] = model
                         chunk_metadata["method"] = "index_file_by_path_ast_chunk"
 
-                        # FIX: Include filepath in document ID to prevent hash collisions
+                        # Include filepath in document ID to prevent hash collisions
                         chunk_doc_id = generate_document_id(
                             chunk["text"], filepath=filepath
                         )
@@ -1133,7 +1133,7 @@ async def index_file_by_path(
             embedding = await get_embedding(
                 document_to_index, model=model, input_type="passage"
             )
-            # FIX: Include filepath in document ID
+            # Include filepath in document ID
             doc_id = generate_document_id(file_content, filepath=filepath)
 
             # Add indexing metadata
@@ -1172,7 +1172,7 @@ async def index_file_by_path(
             # Delete any previous entries for this file before re-indexing (threaded)
             await _delete_entries_by_filepath(filepath, coll)
 
-            # FIX: Include filepath in document ID
+            # Include filepath in document ID
             doc_id = generate_document_id(
                 json.dumps(file_metadata, sort_keys=True), filepath=filepath
             )
@@ -1408,7 +1408,7 @@ async def index_directory(
                             chunk_metadata["chunk_start_line"] = chunk["start_line"]
                             chunk_metadata["chunk_end_line"] = chunk["end_line"]
 
-                            # FIX: Include filepath in document ID
+                            # Include filepath in document ID
                             chunk_doc_id = generate_document_id(
                                 chunk["text"], filepath=file_path
                             )
@@ -1438,7 +1438,7 @@ async def index_directory(
                     embedding = await get_embedding(
                         file_content, model=model, input_type="passage"
                     )
-                    # FIX: Include filepath in document ID
+                    # Include filepath in document ID
                     doc_id = generate_document_id(file_content, filepath=file_path)
 
                     # Threaded upsert
