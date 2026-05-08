@@ -352,8 +352,6 @@ async def normalize_file_content(file_path: str) -> str:
 async def _delete_entries_by_filepath(filepath: str, coll) -> int:
     """Delete all indexed entries for a given filepath from a collection.
 
-    Wrapped in asyncio.to_thread to prevent blocking the event loop.
-
     Args:
         filepath: The file path to remove entries for
         coll: The ChromaDB collection instance
@@ -361,10 +359,33 @@ async def _delete_entries_by_filepath(filepath: str, coll) -> int:
     Returns:
         Number of entries deleted
     """
-    abs_path = os.path.abspath(filepath)
+    return await _delete_entries_by_filepaths([filepath], coll)
+
+
+async def _delete_entries_by_filepaths(filepaths: List[str], coll) -> int:
+    """Delete all indexed entries for a list of filepaths from a collection.
+
+    Wrapped in asyncio.to_thread to prevent blocking the event loop.
+
+    Args:
+        filepaths: List of file paths to remove entries for
+        coll: The ChromaDB collection instance
+
+    Returns:
+        Number of entries deleted
+    """
+    if not filepaths:
+        return 0
+
+    abs_paths = [os.path.abspath(fp) for fp in filepaths]
 
     def _delete():
-        result = coll.delete(where={"filepath": {"$eq": abs_path}})
+        # Use $in operator for bulk deletion if more than one path
+        if len(abs_paths) > 1:
+            result = coll.delete(where={"filepath": {"$in": abs_paths}})
+        else:
+            result = coll.delete(where={"filepath": {"$eq": abs_paths[0]}})
+
         return result.get("deleted", 0) if isinstance(result, dict) else 0
 
     return await asyncio.to_thread(_delete)
@@ -1299,10 +1320,8 @@ async def index_directory(
                 and isinstance(m["filepath"], str)
                 and m["filepath"].startswith(abs_dir_path)
             }
-            removed_orphans = 0
-            for orphan in tracked_files_in_dir:
-                await _delete_entries_by_filepath(orphan, coll)
-                removed_orphans += 1
+            removed_orphans = len(tracked_files_in_dir)
+            await _delete_entries_by_filepaths(list(tracked_files_in_dir), coll)
 
             return {
                 "success": True,
@@ -1480,10 +1499,8 @@ async def index_directory(
 
         # Remove orphaned entries for files that no longer exist in this directory (threaded)
         orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
-        removed_orphans = 0
-        for orphan in orphaned_files:
-            await _delete_entries_by_filepath(orphan, coll)
-            removed_orphans += 1
+        removed_orphans = len(orphaned_files)
+        await _delete_entries_by_filepaths(list(orphaned_files), coll)
 
         return {
             "success": True,
