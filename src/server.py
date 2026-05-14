@@ -24,6 +24,7 @@ from mcp.server.fastmcp import FastMCP
 from chroma_db import (
     CHROMA_PERSIST_DIR,
     _delete_entries_by_filepath,
+    _delete_entries_by_filepaths,
     get_chroma_client,
     get_or_create_collection,
 )
@@ -573,10 +574,10 @@ async def index_directory(
         }
 
         if not code_files:
-            removed_orphans = 0  # pragma: no cover
-            for orphan in tracked_files_in_dir:  # pragma: no cover
-                await _delete_entries_by_filepath(orphan, coll)  # pragma: no cover
-                removed_orphans += 1  # pragma: no cover
+            removed_orphans = len(tracked_files_in_dir)  # pragma: no cover
+            await _delete_entries_by_filepaths(
+                list(tracked_files_in_dir), coll
+            )  # pragma: no cover
             return {  # pragma: no cover
                 "success": True,
                 "directory": os.path.abspath(directory_path),
@@ -718,10 +719,8 @@ async def index_directory(
                         )
 
         orphaned_files = tracked_files_in_dir - successfully_indexed_filepaths
-        removed_orphans = 0
-        for orphan in orphaned_files:
-            await _delete_entries_by_filepath(orphan, coll)  # pragma: no cover
-            removed_orphans += 1  # pragma: no cover
+        removed_orphans = len(orphaned_files)
+        await _delete_entries_by_filepaths(list(orphaned_files), coll)
 
         return {
             "success": True,
