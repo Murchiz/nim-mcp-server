@@ -12,7 +12,7 @@ An MCP server for semantic code search using NVIDIA NIM embeddings and reranking
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.14+
 - NVIDIA API Key from [build.nvidia.com](https://build.nvidia.com/explore/discover)
 
 ## Setup
