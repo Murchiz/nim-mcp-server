@@ -31,3 +31,5 @@ jobs:
       - name: Run tests with coverage
         run: |
           uv run pytest --cov=src --cov-fail-under=100
+        env:
+          NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY || 'dummy_key' }}
