@@ -14,10 +14,10 @@ jobs:
         python-version: ["3.14", "3.14t"]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Setup uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v8
 
       - name: Setup Python
         run: uv python install ${{ matrix.python-version }}
@@ -31,5 +31,3 @@ jobs:
       - name: Run tests with coverage
         run: |
           uv run pytest --cov=src --cov-fail-under=100
-        env:
-          NVIDIA_API_KEY: "dummy_key"
