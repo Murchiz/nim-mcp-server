@@ -58,6 +58,27 @@ async def test_create_and_list_collections(mock_chroma_db):
 
 
 @pytest.mark.asyncio
+async def test_list_collections_coverage_branches(mocker):
+    # Mock get_chroma_client in server
+    mock_client = mocker.MagicMock()
+    mocker.patch("server.get_chroma_client", return_value=mock_client)
+
+    class MockCollectionWithName:
+        def __init__(self, name):
+            self.name = name
+
+    mock_item_with_name = MockCollectionWithName("mock_name_attr")
+    mock_item_other = object()
+
+    mock_client.list_collections.return_value = ["mock_str", mock_item_with_name, mock_item_other]
+
+    res = await list_collections()
+    assert res["success"] is True
+    assert res["collections"] == ["mock_str", "mock_name_attr", str(mock_item_other)]
+    assert res["count"] == 3
+
+
+@pytest.mark.asyncio
 async def test_get_collection_stats(mock_chroma_db):
     await create_collection("test_col2", db_path=mock_chroma_db)
     res = await get_collection_stats(db_path=mock_chroma_db, collection="test_col2")
