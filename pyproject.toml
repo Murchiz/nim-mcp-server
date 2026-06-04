@@ -1,12 +1,12 @@
 [project]
 name = "nim-mcp-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server for semantic code search using NVIDIA NIM embeddings and ChromaDB"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "mcp[cli]>=1.0.0",
-    "chromadb>=0.4.0",
+    "chromadb>=0.4.0,<1.0.0",
     "httpx>=0.27.0",
     "tree-sitter>=0.25.0",
     "tree-sitter-python",

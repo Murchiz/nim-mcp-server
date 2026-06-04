@@ -204,9 +204,19 @@ async def list_collections(
             return client.list_collections()
 
         collections = await asyncio.to_thread(_list)
+        # In ChromaDB v0.6.x+, list_collections() returns collection names (strings) directly.
+        # In other versions, it may return Collection objects.
+        collection_names = []
+        for coll in collections:
+            if isinstance(coll, str):
+                collection_names.append(str(coll))
+            elif hasattr(coll, "name"):
+                collection_names.append(coll.name)
+            else:
+                collection_names.append(str(coll))
         return {
             "success": True,
-            "collections": [coll.name for coll in collections],
+            "collections": collection_names,
             "count": len(collections),
         }
     except Exception as e:  # pragma: no cover
