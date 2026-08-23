@@ -19,7 +19,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)  # pragma: no cover
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
+from fastmcp.tools import Tool
 
 from chroma_db import (
     CHROMA_PERSIST_DIR,
@@ -63,7 +64,6 @@ mcp = FastMCP("nim-code-embed-rerank")
 # ============================================================================
 
 
-@mcp.tool()
 async def search_code(
     query: str,
     db_path: str = CHROMA_PERSIST_DIR,
@@ -155,6 +155,9 @@ async def search_code(
         }
     except Exception as e:  # pragma: no cover
         return {"success": False, "error": f"Search failed: {str(e)}"}
+
+
+mcp.add_tool(Tool.from_function(search_code))
 
 
 async def delete_document(
@@ -767,20 +770,23 @@ def main():  # pragma: no cover
     print(f"Server mode: {SERVER_MODE}")
 
     if SERVER_MODE == "admin":
-        mcp.add_tool(delete_document)
-        mcp.add_tool(delete_collection)
-        mcp.add_tool(list_collections)
-        mcp.add_tool(create_collection)
-        mcp.add_tool(get_collection_stats)
-        mcp.add_tool(health_check)
-        mcp.add_tool(get_supported_languages)
-        mcp.add_tool(get_ast_chunking_info)
-        mcp.add_tool(index_file_by_path)
-        mcp.add_tool(index_directory)
+        for tool_fn in (
+            delete_document,
+            delete_collection,
+            list_collections,
+            create_collection,
+            get_collection_stats,
+            health_check,
+            get_supported_languages,
+            get_ast_chunking_info,
+            index_file_by_path,
+            index_directory,
+        ):
+            mcp.add_tool(Tool.from_function(tool_fn))
         print("Registered admin tools")
     elif SERVER_MODE == "manage":
-        mcp.add_tool(index_file_by_path)
-        mcp.add_tool(index_directory)
+        for tool_fn in (index_file_by_path, index_directory):
+            mcp.add_tool(Tool.from_function(tool_fn))
         print("Registered manage tools")
     else:
         print("Registered search tools: search_code")
