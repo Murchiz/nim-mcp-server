@@ -29,8 +29,8 @@ MANAGE_TOOLS = {
 
 
 async def _registered_tools() -> set[str]:
-    tools = await mcp.get_tools()
-    return set(tools.keys())
+    tools = await mcp.list_tools()
+    return {tool.name for tool in tools}
 
 
 @pytest.mark.asyncio
